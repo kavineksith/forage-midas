@@ -2,39 +2,46 @@ package com.jpmc.midascore.component;
 
 import com.jpmc.midascore.entity.TransactionRecord;
 import com.jpmc.midascore.entity.UserRecord;
+import com.jpmc.midascore.foundation.Incentive;
 import com.jpmc.midascore.foundation.Transaction;
 import com.jpmc.midascore.repository.TransactionRepository;
 import com.jpmc.midascore.repository.UserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestTemplate;
 
 /**
  * Central database gateway for Midas Core.
  *
- * Exposes two methods:
- *  - save(UserRecord)     : direct persistence used by UserPopulator to seed test data
- *  - process(Transaction) : validates a transaction and persists it if all rules pass
+ * Responsibilities:
+ *  - save(UserRecord)     : seed users from test data (called by UserPopulator)
+ *  - process(Transaction) : validate → call Incentive API → persist → update balances
  */
 @Component
 public class DatabaseConduit {
 
     private static final Logger log = LoggerFactory.getLogger(DatabaseConduit.class);
 
+    private static final String INCENTIVE_API_URL = "http://localhost:8080/incentive";
+
     private final UserRepository        userRepository;
     private final TransactionRepository transactionRepository;
+    private final RestTemplate          restTemplate;
 
     public DatabaseConduit(UserRepository userRepository,
-                           TransactionRepository transactionRepository) {
+                           TransactionRepository transactionRepository,
+                           RestTemplateBuilder restTemplateBuilder) {
         this.userRepository        = userRepository;
         this.transactionRepository = transactionRepository;
+        this.restTemplate          = restTemplateBuilder.build();
     }
 
     /**
      * Persists a UserRecord directly.
-     * Called by UserPopulator to load seed users from test data files
-     * before TaskThreeTests (and later tasks) run.
+     * Called by UserPopulator to load seed users before tests run.
      */
     @Transactional
     public void save(UserRecord user) {
@@ -43,17 +50,20 @@ public class DatabaseConduit {
     }
 
     /**
-     * Validates and persists a transaction.
+     * Validates and processes a transaction.
      *
-     * Rules (all must pass):
-     *  1. senderId    → existing UserRecord (null check; repo returns UserRecord directly)
-     *  2. recipientId → existing UserRecord
+     * Validation rules (all must pass):
+     *  1. sender exists
+     *  2. recipient exists
      *  3. sender.balance >= transaction.amount
      *
-     * On success: persist TransactionRecord, debit sender, credit recipient.
-     * On failure: silently discard, no DB state modified.
+     * On success:
+     *  - POST transaction to Incentive API to get incentive amount
+     *  - Persist TransactionRecord (amount + incentive)
+     *  - Debit sender by transaction.amount (incentive is NOT deducted from sender)
+     *  - Credit recipient by transaction.amount + incentive
      *
-     * @Transactional: the three writes are one atomic unit — all succeed or all roll back.
+     * On failure: discard silently, no DB state modified.
      */
     @Transactional
     public void process(Transaction transaction) {
@@ -79,17 +89,36 @@ public class DatabaseConduit {
             return;
         }
 
-        // All valid: persist and update balances
-        transactionRepository.save(
-                new TransactionRecord(sender, recipient, transaction.getAmount()));
+        // Call Incentive API — POST the Transaction, receive Incentive response
+        float incentiveAmount = 0f;
+        try {
+            Incentive incentive = restTemplate.postForObject(
+                    INCENTIVE_API_URL, transaction, Incentive.class);
+            if (incentive != null) {
+                incentiveAmount = incentive.getAmount();
+            }
+        } catch (Exception e) {
+            // If the Incentive API is unreachable, proceed with incentive = 0
+            log.warn("Incentive API call failed ({}), proceeding with incentive=0", e.getMessage());
+        }
 
+        log.info("Transaction processed: sender={} recipient={} amount={} incentive={}",
+                sender.getName(), recipient.getName(), transaction.getAmount(), incentiveAmount);
+
+        // Persist the transaction record with both amount and incentive
+        transactionRepository.save(
+                new TransactionRecord(sender, recipient, transaction.getAmount(), incentiveAmount));
+
+        // Update balances:
+        //   sender   pays  transaction.amount          (incentive is NOT subtracted from sender)
+        //   recipient gets transaction.amount + incentive
         sender.setBalance(sender.getBalance() - transaction.getAmount());
-        recipient.setBalance(recipient.getBalance() + transaction.getAmount());
+        recipient.setBalance(recipient.getBalance() + transaction.getAmount() + incentiveAmount);
         userRepository.save(sender);
         userRepository.save(recipient);
 
-        // Tag both sides so the CI parser finds waldorf regardless of role
-        log.info("WALDORF_BALANCE_CHECK: user={} balance={}", sender.getName(),    sender.getBalance());
-        log.info("WALDORF_BALANCE_CHECK: user={} balance={}", recipient.getName(), recipient.getBalance());
+        log.info("Balance update: sender={} newBalance={} | recipient={} newBalance={}",
+                sender.getName(), sender.getBalance(),
+                recipient.getName(), recipient.getBalance());
     }
 }

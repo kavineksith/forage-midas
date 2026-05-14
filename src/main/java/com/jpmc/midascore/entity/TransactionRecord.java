@@ -21,16 +21,26 @@ public class TransactionRecord {
     @Column(nullable = false)
     private float amount;
 
-    protected TransactionRecord() {}
+    /**
+     * The incentive awarded by the external Incentive API for this transaction.
+     * Added to the recipient's balance but NOT deducted from the sender's balance.
+     */
+    @Column(nullable = false)
+    private float incentive;
 
-    public TransactionRecord(UserRecord sender, UserRecord recipient, float amount) {
+    protected TransactionRecord() {
+    }
+
+    public TransactionRecord(UserRecord sender, UserRecord recipient, float amount, float incentive) {
         this.sender    = sender;
         this.recipient = recipient;
         this.amount    = amount;
+        this.incentive = incentive;
     }
 
     public long       getId()        { return id; }
     public UserRecord getSender()    { return sender; }
     public UserRecord getRecipient() { return recipient; }
     public float      getAmount()    { return amount; }
+    public float      getIncentive() { return incentive; }
 }

@@ -1,0 +1,33 @@
+package com.jpmc.midascore.foundation;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+/**
+ * Represents the response from the Incentive API's /incentive endpoint.
+ * The API returns a single field: "amount" (>= 0).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class Incentive {
+
+    private float amount;
+
+    public Incentive() {
+    }
+
+    public Incentive(float amount) {
+        this.amount = amount;
+    }
+
+    public float getAmount() {
+        return amount;
+    }
+
+    public void setAmount(float amount) {
+        this.amount = amount;
+    }
+
+    @Override
+    public String toString() {
+        return "Incentive{amount=" + amount + "}";
+    }
+}
