@@ -10,26 +10,16 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Optional;
-
 /**
  * Validates incoming transactions and persists the ones that pass.
  *
  * Validation rules (all three must hold):
- *  1. senderId refers to an existing UserRecord.
- *  2. recipientId refers to an existing UserRecord.
- *  3. The sender's balance is >= the transaction amount.
+ *  1. senderId refers to an existing UserRecord
+ *  2. recipientId refers to an existing UserRecord
+ *  3. sender.balance >= transaction.amount
  *
- * On success:
- *  • A {@link TransactionRecord} is persisted with @ManyToOne refs to sender/recipient.
- *  • Sender balance is decremented by the transaction amount.
- *  • Recipient balance is incremented by the transaction amount.
- *
- * On failure:
- *  • The transaction is silently discarded; no DB state is modified.
- *
- * @Transactional ensures that the three writes (insert + two updates) either
- * all succeed or all roll back — critical for financial data integrity.
+ * On success: persist TransactionRecord, debit sender, credit recipient.
+ * On failure: discard silently — no DB state modified.
  */
 @Component
 public class DatabaseConduit {
@@ -48,47 +38,36 @@ public class DatabaseConduit {
     @Transactional
     public void process(Transaction transaction) {
 
-        // ── Rule 1: sender must exist ─────────────────────────────────────
-        Optional<UserRecord> senderOpt =
-                userRepository.findById(transaction.getSenderId());
-        if (senderOpt.isEmpty()) {
-            log.warn("Invalid transaction — sender {} not found", transaction.getSenderId());
+        // Rule 1 — sender exists?
+        UserRecord sender = userRepository.findById(transaction.getSenderId());
+        if (sender == null) {
+            log.warn("Discarding — sender {} not found", transaction.getSenderId());
             return;
         }
 
-        // ── Rule 2: recipient must exist ──────────────────────────────────
-        Optional<UserRecord> recipientOpt =
-                userRepository.findById(transaction.getRecipientId());
-        if (recipientOpt.isEmpty()) {
-            log.warn("Invalid transaction — recipient {} not found", transaction.getRecipientId());
+        // Rule 2 — recipient exists?
+        UserRecord recipient = userRepository.findById(transaction.getRecipientId());
+        if (recipient == null) {
+            log.warn("Discarding — recipient {} not found", transaction.getRecipientId());
             return;
         }
 
-        UserRecord sender    = senderOpt.get();
-        UserRecord recipient = recipientOpt.get();
-
-        // ── Rule 3: sender balance must cover the amount ──────────────────
+        // Rule 3 — sufficient balance?
         if (sender.getBalance() < transaction.getAmount()) {
-            log.warn("Invalid transaction — sender {} has insufficient balance ({} < {})",
+            log.warn("Discarding — sender {} balance {} < amount {}",
                     sender.getId(), sender.getBalance(), transaction.getAmount());
             return;
         }
 
-        // ── All rules passed: persist and update balances ─────────────────
-        transactionRepository.save(
-                new TransactionRecord(sender, recipient, transaction.getAmount())
-        );
+        // All valid: persist and adjust balances
+        transactionRepository.save(new TransactionRecord(sender, recipient, transaction.getAmount()));
 
         sender.setBalance(sender.getBalance() - transaction.getAmount());
         recipient.setBalance(recipient.getBalance() + transaction.getAmount());
-
         userRepository.save(sender);
         userRepository.save(recipient);
 
-        log.info("Transaction recorded: {} → {} | amount={} | sender_balance={} | recipient_balance={}",
-                sender.getId(), recipient.getId(),
-                transaction.getAmount(),
-                sender.getBalance(),
-                recipient.getBalance());
+        log.info("WALDORF_BALANCE_CHECK: user={} balance={}", sender.getName(),    sender.getBalance());
+        log.info("WALDORF_BALANCE_CHECK: user={} balance={}", recipient.getName(), recipient.getBalance());
     }
 }
