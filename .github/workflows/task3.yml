@@ -1,12 +1,12 @@
 # =============================================================================
-# .github/workflows/task3.yml  (fixed)
+# .github/workflows/task3.yml  (v3 — fully corrected)
 #
-# Fixes applied vs the previous version:
-#   1. Deletes TransactionListener.java (scaffold file with wrong filename)
-#      before writing the correct TransactionKafkaListener.java
-#   2. Removes duplicate-class risk by cleaning any old listener files first
-#   3. DatabaseConduit uses UserRecord directly (no Optional wrapper) because
-#      the scaffold UserRepository returns UserRecord, not Optional<UserRecord>
+# Fixes vs previous version:
+#   1. DatabaseConduit heredoc now includes the save(UserRecord) method
+#      that UserPopulator calls at line 21
+#   2. Parse + summary steps use "if: always()" so task3_answer.md is
+#      always written even when the build or tests fail
+#   3. Build step has continue-on-error: true so downstream steps run
 # =============================================================================
 
 name: "Midas Task 3 — H2 Database & waldorf Balance"
@@ -41,7 +41,7 @@ jobs:
           distribution: "temurin"
           cache: "maven"
 
-      # ── 3. Ensure pom.xml dependencies (idempotent) ────────────────────────
+      # ── 3. Ensure pom.xml dependencies ────────────────────────────────────
       - name: "Ensure required dependencies in pom.xml"
         run: |
           python3 << 'PYEOF'
@@ -77,7 +77,7 @@ jobs:
           tree.write(POM, xml_declaration=True, encoding="UTF-8")
           PYEOF
 
-      # ── 4. Patch application.yml ───────────────────────────────────────────
+      # ── 4. Write application.yml ───────────────────────────────────────────
       - name: "Write application.yml (H2 + JPA + kafka-topic)"
         run: |
           APP="src/main/resources/application.yml"
@@ -102,7 +102,6 @@ jobs:
                 enabled: true
                 path: /h2-console
           YMLEOF
-          # Strip the leading indentation added by the heredoc
           python3 -c "
           import textwrap, pathlib
           p = pathlib.Path('$APP')
@@ -111,8 +110,8 @@ jobs:
           echo "--- application.yml ---"
           cat "$APP"
 
-      # ── 5. Discover project layout ─────────────────────────────────────────
-      - name: "Discover package and source directory"
+      # ── 5. Discover package and source directory ───────────────────────────
+      - name: "Discover project layout"
         id: discover
         run: |
           python3 << 'PYEOF'
@@ -140,31 +139,14 @@ jobs:
               f.write(f"java_dir={java_dir}\n")
           PYEOF
 
-      # ── 6. FIX: Remove conflicting scaffold listener files ─────────────────
-      #
-      # The scaffold ships TransactionListener.java which contains a class
-      # named TransactionKafkaListener — wrong filename causes:
-      #   "class TransactionKafkaListener should be in TransactionKafkaListener.java"
-      # We also need to remove any stale Task 2 TransactionKafkaListener.java
-      # to avoid the duplicate-class error before we write the correct one.
+      # ── 6. Remove conflicting scaffold listener files ──────────────────────
       - name: "Remove conflicting listener files"
         env:
           JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
         run: |
           COMPONENT="${JAVA_DIR}/component"
-
-          # The scaffold file with the wrong filename
-          if [ -f "${COMPONENT}/TransactionListener.java" ]; then
-            rm -f "${COMPONENT}/TransactionListener.java"
-            echo "Removed TransactionListener.java (wrong filename for class TransactionKafkaListener)"
-          fi
-
-          # Any stale Task 2 listener (will be rewritten below)
-          if [ -f "${COMPONENT}/TransactionKafkaListener.java" ]; then
-            rm -f "${COMPONENT}/TransactionKafkaListener.java"
-            echo "Removed old TransactionKafkaListener.java (will rewrite)"
-          fi
-
+          rm -f "${COMPONENT}/TransactionListener.java"
+          rm -f "${COMPONENT}/TransactionKafkaListener.java"
           echo "Listener cleanup done. Remaining component files:"
           ls -1 "${COMPONENT}/" 2>/dev/null || echo "(empty)"
 
@@ -180,10 +162,6 @@ jobs:
 
           import jakarta.persistence.*;
 
-          /**
-           * Persisted record of a validated financial transaction.
-           * Many transactions share the same sender/recipient UserRecord — hence @ManyToOne.
-           */
           @Entity
           @Table(name = "transaction_record")
           public class TransactionRecord {
@@ -211,10 +189,10 @@ jobs:
                   this.amount    = amount;
               }
 
-              public long      getId()        { return id; }
-              public UserRecord getSender()   { return sender; }
-              public UserRecord getRecipient(){ return recipient; }
-              public float      getAmount()   { return amount; }
+              public long       getId()        { return id; }
+              public UserRecord getSender()    { return sender; }
+              public UserRecord getRecipient() { return recipient; }
+              public float      getAmount()    { return amount; }
           }
           JAVAEOF
           sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/entity/TransactionRecord.java"
@@ -243,10 +221,10 @@ jobs:
 
       # ── 9. Write DatabaseConduit.java ──────────────────────────────────────
       #
-      # FIX: UserRepository.findById(long) in this scaffold returns UserRecord
-      # directly (not Optional<UserRecord>), so we use null checks instead of
-      # Optional.isEmpty(). Using Optional here caused the compilation errors:
-      #   "incompatible types: UserRecord cannot be converted to Optional<UserRecord>"
+      # IMPORTANT: includes save(UserRecord) which UserPopulator calls at line 21.
+      # Without this method the build fails with a missing-symbol error.
+      # Also uses null checks (not Optional) because UserRepository.findById(long)
+      # returns UserRecord directly in this scaffold.
       - name: "Write component/DatabaseConduit.java"
         env:
           PACKAGE:  ${{ steps.discover.outputs.package }}
@@ -267,14 +245,11 @@ jobs:
           import org.springframework.transaction.annotation.Transactional;
 
           /**
-           * Validates and persists financial transactions.
+           * Central database gateway for Midas Core.
            *
-           * Validation rules:
-           *  1. senderId must map to a real UserRecord (null check — repo returns UserRecord directly)
-           *  2. recipientId must map to a real UserRecord
-           *  3. sender.balance >= transaction.amount
-           *
-           * @Transactional: all three writes (insert + 2 balance updates) are atomic.
+           * Exposes two methods:
+           *  - save(UserRecord)     : direct persistence used by UserPopulator to seed test data
+           *  - process(Transaction) : validates a transaction and persists it if all rules pass
            */
           @Component
           public class DatabaseConduit {
@@ -290,32 +265,55 @@ jobs:
                   this.transactionRepository = transactionRepository;
               }
 
+              /**
+               * Persists a UserRecord directly.
+               * Called by UserPopulator to load seed users from test data files
+               * before TaskThreeTests (and later tasks) run.
+               */
+              @Transactional
+              public void save(UserRecord user) {
+                  userRepository.save(user);
+                  log.info("User saved: id={} name={} balance={}", user.getId(), user.getName(), user.getBalance());
+              }
+
+              /**
+               * Validates and persists a transaction.
+               *
+               * Rules (all must pass):
+               *  1. senderId    → existing UserRecord (null check; repo returns UserRecord directly)
+               *  2. recipientId → existing UserRecord
+               *  3. sender.balance >= transaction.amount
+               *
+               * On success: persist TransactionRecord, debit sender, credit recipient.
+               * On failure: silently discard, no DB state modified.
+               *
+               * @Transactional: the three writes are one atomic unit — all succeed or all roll back.
+               */
               @Transactional
               public void process(Transaction transaction) {
 
-                  // Rule 1: sender must exist
-                  // NOTE: UserRepository.findById returns UserRecord (not Optional)
+                  // Rule 1 — sender exists?
                   UserRecord sender = userRepository.findById(transaction.getSenderId());
                   if (sender == null) {
                       log.warn("Discarding — sender {} not found", transaction.getSenderId());
                       return;
                   }
 
-                  // Rule 2: recipient must exist
+                  // Rule 2 — recipient exists?
                   UserRecord recipient = userRepository.findById(transaction.getRecipientId());
                   if (recipient == null) {
                       log.warn("Discarding — recipient {} not found", transaction.getRecipientId());
                       return;
                   }
 
-                  // Rule 3: sender has sufficient balance
+                  // Rule 3 — sufficient balance?
                   if (sender.getBalance() < transaction.getAmount()) {
                       log.warn("Discarding — sender {} balance {} < amount {}",
                               sender.getId(), sender.getBalance(), transaction.getAmount());
                       return;
                   }
 
-                  // All valid: persist TransactionRecord and update both balances
+                  // All valid: persist and update balances
                   transactionRepository.save(
                           new TransactionRecord(sender, recipient, transaction.getAmount()));
 
@@ -324,19 +322,16 @@ jobs:
                   userRepository.save(sender);
                   userRepository.save(recipient);
 
-                  // Log both sides so the CI parser can find waldorf regardless of role
+                  // Tag both sides so the CI parser finds waldorf regardless of role
                   log.info("WALDORF_BALANCE_CHECK: user={} balance={}", sender.getName(),    sender.getBalance());
                   log.info("WALDORF_BALANCE_CHECK: user={} balance={}", recipient.getName(), recipient.getBalance());
               }
           }
           JAVAEOF
           sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/DatabaseConduit.java"
-          echo "DatabaseConduit.java written"
+          echo "DatabaseConduit.java written (includes save() + process())"
 
       # ── 10. Write TransactionKafkaListener.java ────────────────────────────
-      #
-      # FIX: Written fresh after the old conflicting files were deleted in step 6.
-      # Only one file, correct name, correct class name — no more duplicate error.
       - name: "Write component/TransactionKafkaListener.java"
         env:
           PACKAGE:  ${{ steps.discover.outputs.package }}
@@ -351,10 +346,6 @@ jobs:
           import org.springframework.kafka.annotation.KafkaListener;
           import org.springframework.stereotype.Component;
 
-          /**
-           * Kafka consumer — receives Transaction DTOs from the trader-updates topic
-           * and delegates to DatabaseConduit for validation and persistence.
-           */
           @Component
           public class TransactionKafkaListener {
 
@@ -378,24 +369,39 @@ jobs:
           }
           JAVAEOF
           sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/TransactionKafkaListener.java"
-          echo "TransactionKafkaListener.java written"
-          echo ""
+
           echo "=== Final component/ contents ==="
           ls -1 "${JAVA_DIR}/component/"
 
       # ── 11. Build ──────────────────────────────────────────────────────────
+      # continue-on-error: true so the parse step always runs and produces
+      # task3_answer.md even when the build fails — prevents the
+      # "cat: task3_answer.md: No such file or directory" error on summary.
       - name: "Maven clean install (skip tests)"
-        run: mvn clean install -DskipTests --no-transfer-progress
+        id: build
+        run: mvn clean install -DskipTests --no-transfer-progress 2>&1 | tee build_output.txt
+        continue-on-error: true
 
       # ── 12. Run TaskThreeTests ─────────────────────────────────────────────
       - name: "Run TaskThreeTests"
+        if: steps.build.outcome == 'success'
         run: |
           mvn -Dtest=TaskThreeTests test --no-transfer-progress \
             2>&1 | tee test_output_task3.txt
         continue-on-error: true
 
+      # Ensure test_output_task3.txt exists even when build failed
+      - name: "Ensure test output file exists"
+        if: always()
+        run: |
+          if [ ! -f test_output_task3.txt ]; then
+            cat build_output.txt > test_output_task3.txt 2>/dev/null || echo "Build failed — no test output" > test_output_task3.txt
+          fi
+
       # ── 13. Parse waldorf balance → task3_answer.md ────────────────────────
+      # if: always() guarantees this step runs regardless of build/test outcome
       - name: "Parse waldorf balance → task3_answer.md"
+        if: always()
         run: |
           python3 << 'PYEOF'
           import re, math, textwrap
@@ -403,17 +409,15 @@ jobs:
 
           raw = Path("test_output_task3.txt").read_text(errors="replace")
 
-          # Strategy 1: our custom WALDORF_BALANCE_CHECK log lines
+          # Strategy 1: our WALDORF_BALANCE_CHECK log lines
           waldorf_hits = re.findall(
               r"WALDORF_BALANCE_CHECK:\s*user=waldorf\s+balance=([\d.]+)", raw
           )
           final_raw = waldorf_hits[-1] if waldorf_hits else None
 
-          # Strategy 2: generic pattern (user waldorf, any log format)
+          # Strategy 2: any line mentioning waldorf and a number
           if not final_raw:
-              hits = re.findall(
-                  r"(?i)waldorf[^\d]*([\d.]+)", raw
-              )
+              hits = re.findall(r"(?i)waldorf[^\d]*([\d.]+)", raw)
               final_raw = hits[-1] if hits else None
 
           # Strategy 3: BEGIN…END snippet
@@ -423,8 +427,12 @@ jobs:
               hits = re.findall(r"(?i)waldorf[^\d]*([\d.]+)", snippet)
               final_raw = hits[-1] if hits else None
 
+          # Check for build errors to surface in the answer file
+          build_errors = re.findall(r"(?m)^Error:.*$", raw)
+          error_block = "\n".join(build_errors[:20]) if build_errors else ""
+
           if final_raw:
-              val = float(final_raw)
+              val     = float(final_raw)
               floored = math.floor(val)
               answer_block = f"""
           ### waldorf's final balance
@@ -438,10 +446,18 @@ jobs:
           """
           else:
               floored = "?"
-              answer_block = """
+              answer_block = f"""
           ⚠️  Could not automatically parse waldorf's balance.
-          Open `test_output_task3.txt` from the artefacts, search for `waldorf`,
-          find the last balance value, and floor it to the nearest integer.
+
+          {'**Build errors detected:**' if error_block else ''}
+          {'```' if error_block else ''}
+          {error_block}
+          {'```' if error_block else ''}
+
+          **Manual steps:**
+          1. Download `test_output_task3.txt` from Actions → Artefacts
+          2. Search for `waldorf`
+          3. Take the last balance value and apply `math.floor()`
           """
 
           snippet_section = f"""
@@ -465,22 +481,22 @@ jobs:
 
           | File | Path | Action |
           |------|------|--------|
-          | `TransactionRecord.java` | `entity/` | Created — JPA entity |
-          | `TransactionRepository.java` | `repository/` | Created — Spring Data repo |
-          | `DatabaseConduit.java` | `component/` | Written — validation + persistence |
+          | `TransactionRecord.java`      | `entity/`      | Created — JPA entity |
+          | `TransactionRepository.java`  | `repository/`  | Created — Spring Data repo |
+          | `DatabaseConduit.java`        | `component/`   | Written — `save()` + `process()` |
           | `TransactionKafkaListener.java` | `component/` | Rewritten — wires DatabaseConduit |
-          | `application.yml` | `src/main/resources/` | Updated — H2 + JPA config |
-          | `TransactionListener.java` | `component/` | **Deleted** — wrong filename for class |
+          | `application.yml`             | `src/main/resources/` | Updated — H2 + JPA |
+          | `TransactionListener.java`    | `component/`   | **Deleted** — wrong filename |
 
           ---
 
-          ## Full test output
+          ## Full output
 
           <details>
           <summary>Click to expand</summary>
 
           ```
-          {raw}
+          {raw[:30000]}
           ```
 
           </details>
@@ -488,11 +504,12 @@ jobs:
 
           Path("task3_answer.md").write_text(textwrap.dedent(md))
           print("task3_answer.md written")
-          print(f"waldorf balance → {final_raw}  (floor = {floored})")
+          print(f"waldorf → {final_raw}  (floor = {floored})")
           PYEOF
 
       # ── 14. Commit ─────────────────────────────────────────────────────────
       - name: "Commit generated files"
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -500,12 +517,11 @@ jobs:
                   src/main/resources/application.yml \
                   src/main/java \
                   task3_answer.md 2>/dev/null || true
-          # Stage deletions (TransactionListener.java)
           git add -u src/main/java 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "ci: Task 3 — fix listener conflict + JPA integration [skip ci]"
+            git commit -m "ci: Task 3 — DatabaseConduit save() + JPA integration [skip ci]"
             git push
           fi
 
@@ -518,6 +534,7 @@ jobs:
           path: |
             task3_answer.md
             test_output_task3.txt
+            build_output.txt
           retention-days: 30
 
       # ── 16. Actions job summary ────────────────────────────────────────────
