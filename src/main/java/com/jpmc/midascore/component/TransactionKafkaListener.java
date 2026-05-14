@@ -6,13 +6,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
-/**
- * Kafka consumer for the trader-updates topic.
- *
- * Hands every deserialized {@link Transaction} straight to
- * {@link DatabaseConduit} for validation and persistence.
- * The listener itself stays thin — no business logic here.
- */
 @Component
 public class TransactionKafkaListener {
 
