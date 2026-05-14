@@ -153,7 +153,7 @@ jobs:
       # ── 7. Write TransactionRecord.java ───────────────────────────────────
       - name: "Write entity/TransactionRecord.java"
         env:
-          PACKAGE:  ${{ steps.discover.outputs.package }}
+          PACKAGE: ${{ steps.discover.outputs.package }}
           JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
         run: |
           mkdir -p "${JAVA_DIR}/entity"
@@ -201,7 +201,7 @@ jobs:
       # ── 8. Write TransactionRepository.java ───────────────────────────────
       - name: "Write repository/TransactionRepository.java"
         env:
-          PACKAGE:  ${{ steps.discover.outputs.package }}
+          PACKAGE: ${{ steps.discover.outputs.package }}
           JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
         run: |
           mkdir -p "${JAVA_DIR}/repository"
@@ -227,7 +227,7 @@ jobs:
       # returns UserRecord directly in this scaffold.
       - name: "Write component/DatabaseConduit.java"
         env:
-          PACKAGE:  ${{ steps.discover.outputs.package }}
+          PACKAGE: ${{ steps.discover.outputs.package }}
           JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
         run: |
           mkdir -p "${JAVA_DIR}/component"
@@ -334,7 +334,7 @@ jobs:
       # ── 10. Write TransactionKafkaListener.java ────────────────────────────
       - name: "Write component/TransactionKafkaListener.java"
         env:
-          PACKAGE:  ${{ steps.discover.outputs.package }}
+          PACKAGE: ${{ steps.discover.outputs.package }}
           JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
         run: |
           cat > "${JAVA_DIR}/component/TransactionKafkaListener.java" << 'JAVAEOF'
@@ -379,7 +379,8 @@ jobs:
       # "cat: task3_answer.md: No such file or directory" error on summary.
       - name: "Maven clean install (skip tests)"
         id: build
-        run: mvn clean install -DskipTests --no-transfer-progress 2>&1 | tee build_output.txt
+        run: mvn clean install -DskipTests --no-transfer-progress 2>&1 | tee
+          build_output.txt
         continue-on-error: true
 
       # ── 12. Run TaskThreeTests ─────────────────────────────────────────────
@@ -399,7 +400,6 @@ jobs:
           fi
 
       # ── 13. Parse waldorf balance → task3_answer.md ────────────────────────
-      # if: always() guarantees this step runs regardless of build/test outcome
       - name: "Parse waldorf balance → task3_answer.md"
         if: always()
         run: |
@@ -407,34 +407,54 @@ jobs:
           import re, math, textwrap
           from pathlib import Path
 
-          raw = Path("test_output_task3.txt").read_text(errors="replace")
+          log_file = Path("test_output_task3.txt")
+          raw = log_file.read_text(errors="replace") if log_file.exists() else ""
 
-          # Strategy 1: our WALDORF_BALANCE_CHECK log lines
-          waldorf_hits = re.findall(
-              r"WALDORF_BALANCE_CHECK:\s*user=waldorf\s+balance=([\d.]+)", raw
+          print(f"Log file size: {len(raw)} chars")
+
+          # ── 1. Our own WALDORF_BALANCE_CHECK tag ──────────────────────────
+          hits = re.findall(
+              r"WALDORF_BALANCE_CHECK:\s*user=waldorf\s+balance=([\S]+)", raw, re.IGNORECASE
           )
-          final_raw = waldorf_hits[-1] if waldorf_hits else None
+          final_raw = hits[-1] if hits else None
 
-          # Strategy 2: any line mentioning waldorf and a number
+          # ── 2. Any log line containing "waldorf" and a decimal number ─────
           if not final_raw:
-              hits = re.findall(r"(?i)waldorf[^\d]*([\d.]+)", raw)
-              final_raw = hits[-1] if hits else None
+              for line in reversed(raw.splitlines()):
+                  if "waldorf" in line.lower():
+                      print(f"  [waldorf line] {line.strip()}")
+                      nums = re.findall(r"[\d]+\.[\d]+", line)
+                      if nums:
+                          final_raw = nums[-1]
+                          break
 
-          # Strategy 3: BEGIN…END snippet
+          # ── 3. Search the BEGIN…END snippet ───────────────────────────────
           snippet_m = re.search(r"(BEGIN.*?END)", raw, re.DOTALL)
           snippet   = snippet_m.group(1).strip() if snippet_m else None
-          if snippet and not final_raw:
-              hits = re.findall(r"(?i)waldorf[^\d]*([\d.]+)", snippet)
-              final_raw = hits[-1] if hits else None
+          if snippet:
+              print(f"\n[BEGIN…END snippet found]\n{snippet}\n")
+              if not final_raw:
+                  nums = re.findall(r"[\d]+\.[\d]+", snippet)
+                  if nums:
+                      final_raw = nums[-1]
 
-          # Check for build errors to surface in the answer file
-          build_errors = re.findall(r"(?m)^Error:.*$", raw)
-          error_block = "\n".join(build_errors[:20]) if build_errors else ""
+          # ── 4. Print ALL lines containing a balance keyword for diagnosis ─
+          print("\n=== Lines containing 'balance' or 'waldorf' ===")
+          for line in raw.splitlines():
+              low = line.lower()
+              if "balance" in low or "waldorf" in low:
+                  print(f"  {line.strip()}")
 
+          # ── 5. Print tail of log (where test results usually appear) ──────
+          tail = "\n".join(raw.splitlines()[-150:])
+          print(f"\n=== LAST 150 LINES OF LOG ===\n{tail}")
+
+          # ── Build answer ──────────────────────────────────────────────────
           if final_raw:
-              val     = float(final_raw)
-              floored = math.floor(val)
-              answer_block = f"""
+              try:
+                  val     = float(final_raw.rstrip(',;)'))
+                  floored = math.floor(val)
+                  answer_block = f"""
           ### waldorf's final balance
 
           | | Value |
@@ -444,20 +464,21 @@ jobs:
 
           > ✅ **Submit this value: `{floored}`**
           """
+              except ValueError:
+                  floored = "parse error"
+                  answer_block = f"Found text `{final_raw}` near waldorf but could not convert to float."
           else:
-              floored = "?"
-              answer_block = f"""
-          ⚠️  Could not automatically parse waldorf's balance.
+              floored = "not found"
+              answer_block = """
+          ⚠️  Automatic parsing could not find waldorf's balance.
 
-          {'**Build errors detected:**' if error_block else ''}
-          {'```' if error_block else ''}
-          {error_block}
-          {'```' if error_block else ''}
+          **Check the Actions log for the section:**
+          `=== Lines containing 'balance' or 'waldorf' ===`
+          and
+          `=== LAST 150 LINES OF LOG ===`
 
-          **Manual steps:**
-          1. Download `test_output_task3.txt` from Actions → Artefacts
-          2. Search for `waldorf`
-          3. Take the last balance value and apply `math.floor()`
+          These are printed directly to the Actions step output above — no download needed.
+          Find the last balance value next to waldorf and apply `math.floor()`.
           """
 
           snippet_section = f"""
@@ -466,45 +487,48 @@ jobs:
           ```
           {snippet}
           ```
-          """ if snippet else ""
+          """ if snippet else "*(No BEGIN…END block found in test output)*"
 
+          # Full log — NO truncation this time
           md = f"""# Midas Task 3 — Answer
 
           ## waldorf's balance after all transactions
 
           {answer_block}
 
+          ---
+
           {snippet_section}
+
           ---
 
           ## Files created / modified
 
           | File | Path | Action |
           |------|------|--------|
-          | `TransactionRecord.java`      | `entity/`      | Created — JPA entity |
-          | `TransactionRepository.java`  | `repository/`  | Created — Spring Data repo |
-          | `DatabaseConduit.java`        | `component/`   | Written — `save()` + `process()` |
-          | `TransactionKafkaListener.java` | `component/` | Rewritten — wires DatabaseConduit |
-          | `application.yml`             | `src/main/resources/` | Updated — H2 + JPA |
-          | `TransactionListener.java`    | `component/`   | **Deleted** — wrong filename |
+          | `TransactionRecord.java`        | `entity/`             | Created — JPA entity |
+          | `TransactionRepository.java`    | `repository/`         | Created — Spring Data repo |
+          | `DatabaseConduit.java`          | `component/`          | Written — `save()` + `process()` |
+          | `TransactionKafkaListener.java` | `component/`          | Rewritten — wires DatabaseConduit |
+          | `application.yml`               | `src/main/resources/` | Updated — H2 + JPA config |
+          | `TransactionListener.java`      | `component/`          | **Deleted** — wrong filename |
 
           ---
 
-          ## Full output
+          ## Full test output
 
           <details>
-          <summary>Click to expand</summary>
+          <summary>Click to expand (full, untruncated)</summary>
 
           ```
-          {raw[:30000]}
+          {raw}
           ```
 
           </details>
           """
 
           Path("task3_answer.md").write_text(textwrap.dedent(md))
-          print("task3_answer.md written")
-          print(f"waldorf → {final_raw}  (floor = {floored})")
+          print(f"\ntask3_answer.md written. waldorf balance = {final_raw} → floor = {floored}")
           PYEOF
 
       # ── 14. Commit ─────────────────────────────────────────────────────────
