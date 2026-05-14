@@ -24,695 +24,669 @@
 name: "Midas Tasks 4 & 5 — Incentive API + Balance Endpoint"
 
 on:
-    push:
-        branches: [ "main", "master" ]
-    pull_request:
-        branches: [ "main", "master" ]
-    workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
-    task-four-five:
-        name: "Incentive API integration + Balance endpoint"
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
+  task-four-five:
+    name: "Incentive API integration + Balance endpoint"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-        steps:
+    steps:
 
-            # ── 1. Checkout ────────────────────────────────────────────────────────
-            - name: "Checkout repository"
-              uses: actions/checkout@v4
-              with:
-                  fetch-depth: 0
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-            # ── 2. Java 17 ─────────────────────────────────────────────────────────
-            - name: "Set up Java 17"
-              uses: actions/setup-java@v4
-              with:
-                  java-version: "17"
-                  distribution: "temurin"
-                  cache: "maven"
+      # ── 2. Java 17 ─────────────────────────────────────────────────────────
+      - name: "Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
 
-            # ── 3. Ensure pom.xml dependencies ────────────────────────────────────
-            - name: "Ensure required dependencies in pom.xml"
-              run: |
-                  python3 << 'PYEOF'
-                  import xml.etree.ElementTree as ET
+      # ── 3. Ensure pom.xml dependencies ────────────────────────────────────
+      - name: "Ensure required dependencies in pom.xml"
+        run: |
+          python3 << 'PYEOF'
+          import xml.etree.ElementTree as ET
 
-                  POM = "pom.xml"
-                  NS  = "http://maven.apache.org/POM/4.0.0"
-                  TAG = f"{{{NS}}}"
-                  ET.register_namespace("", NS)
+          POM = "pom.xml"
+          NS  = "http://maven.apache.org/POM/4.0.0"
+          TAG = f"{{{NS}}}"
+          ET.register_namespace("", NS)
 
-                  tree = ET.parse(POM)
-                  root = tree.getroot()
-                  deps_el = root.find(f"{TAG}dependencies")
-                  if deps_el is None:
-                      deps_el = ET.SubElement(root, f"{TAG}dependencies")
+          tree = ET.parse(POM)
+          root = tree.getroot()
+          deps_el = root.find(f"{TAG}dependencies")
+          if deps_el is None:
+              deps_el = ET.SubElement(root, f"{TAG}dependencies")
 
-                  existing = {
-                      el.findtext(f"{TAG}artifactId", "")
-                      for el in deps_el.findall(f"{TAG}dependency")
+          existing = {
+              el.findtext(f"{TAG}artifactId", "")
+              for el in deps_el.findall(f"{TAG}dependency")
+          }
+
+          required = [
+              dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-data-jpa", version="3.2.5"),
+              dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-web",       version="3.2.5"),
+              dict(groupId="org.springframework.kafka", artifactId="spring-kafka",                  version="3.1.4"),
+              dict(groupId="com.h2database",            artifactId="h2",                            version="2.2.224", scope="runtime"),
+              dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-test",      version="3.2.5",   scope="test"),
+              dict(groupId="org.springframework.kafka", artifactId="spring-kafka-test",             version="3.1.4",   scope="test"),
+              dict(groupId="org.testcontainers",        artifactId="kafka",                         version="1.19.1",  scope="test"),
+              dict(groupId="com.fasterxml.jackson.core",artifactId="jackson-databind",              version="2.15.4"),
+          ]
+
+          for dep in required:
+              if dep["artifactId"] not in existing:
+                  el = ET.SubElement(deps_el, f"{TAG}dependency")
+                  for k, v in dep.items():
+                      ET.SubElement(el, f"{TAG}{k}").text = v
+                  print(f"  [added] {dep['artifactId']}")
+              else:
+                  print(f"  [ok]    {dep['artifactId']}")
+
+          tree.write(POM, xml_declaration=True, encoding="UTF-8")
+          PYEOF
+
+      # ── 4. Discover package and source directory ───────────────────────────
+      - name: "Discover project layout"
+        id: discover
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess
+          from pathlib import Path
+
+          result = subprocess.run(
+              ["grep", "-rl", "@SpringBootApplication", "src/main/java"],
+              capture_output=True, text=True
+          )
+          main_file = Path(result.stdout.strip().splitlines()[0])
+          java_dir  = main_file.parent
+
+          pkg_line = next(
+              l for l in main_file.read_text().splitlines()
+              if l.strip().startswith("package ")
+          )
+          package = pkg_line.strip().removeprefix("package ").removesuffix(";").strip()
+
+          print(f"Package  : {package}")
+          print(f"Java dir : {java_dir}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"package={package}\n")
+              f.write(f"java_dir={java_dir}\n")
+          PYEOF
+
+      # ── 5. Write application.yml ───────────────────────────────────────────
+      - name: "Write application.yml"
+        run: |
+          APP="src/main/resources/application.yml"
+          mkdir -p "$(dirname "$APP")"
+          cat > "$APP" << 'YMLEOF'
+          general:
+            kafka-topic: trader-updates
+
+          server:
+            port: 33400
+
+          spring:
+            kafka:
+              bootstrap-servers: localhost:9092
+
+            datasource:
+              url: jdbc:h2:mem:midasdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+              driver-class-name: org.h2.Driver
+              username: sa
+              password:
+
+            jpa:
+              database-platform: org.hibernate.dialect.H2Dialect
+              hibernate:
+                ddl-auto: create-drop
+              show-sql: false
+              properties:
+                hibernate:
+                  format_sql: true
+
+            h2:
+              console:
+                enabled: true
+                path: /h2-console
+          YMLEOF
+
+          python3 -c "
+          import textwrap, pathlib
+          p = pathlib.Path('$APP')
+          p.write_text(textwrap.dedent(p.read_text()))
+          "
+          echo "--- application.yml ---"
+          cat "$APP"
+
+      # ── 6. Write Incentive.java ────────────────────────────────────────────
+      - name: "Write foundation/Incentive.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/foundation"
+          cat > "${JAVA_DIR}/foundation/Incentive.java" << 'JAVAEOF'
+          package PLACEHOLDER.foundation;
+
+          import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
+          @JsonIgnoreProperties(ignoreUnknown = true)
+          public class Incentive {
+
+              private float amount;
+
+              public Incentive() {}
+
+              public Incentive(float amount) {
+                  this.amount = amount;
+              }
+
+              public float getAmount() { return amount; }
+              public void setAmount(float amount) { this.amount = amount; }
+
+              @Override
+              public String toString() {
+                  return "Incentive{amount=" + amount + "}";
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/foundation/Incentive.java"
+          echo "Incentive.java written"
+
+      # ── 7. Write TransactionRecord.java (with incentive field) ────────────
+      - name: "Write entity/TransactionRecord.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/entity"
+          cat > "${JAVA_DIR}/entity/TransactionRecord.java" << 'JAVAEOF'
+          package PLACEHOLDER.entity;
+
+          import jakarta.persistence.*;
+
+          @Entity
+          @Table(name = "transaction_record")
+          public class TransactionRecord {
+
+              @Id
+              @GeneratedValue(strategy = GenerationType.IDENTITY)
+              private long id;
+
+              @ManyToOne(fetch = FetchType.LAZY, optional = false)
+              @JoinColumn(name = "sender_id", nullable = false)
+              private UserRecord sender;
+
+              @ManyToOne(fetch = FetchType.LAZY, optional = false)
+              @JoinColumn(name = "recipient_id", nullable = false)
+              private UserRecord recipient;
+
+              @Column(nullable = false)
+              private float amount;
+
+              @Column(nullable = false)
+              private float incentive;
+
+              protected TransactionRecord() {}
+
+              public TransactionRecord(UserRecord sender, UserRecord recipient,
+                                       float amount, float incentive) {
+                  this.sender    = sender;
+                  this.recipient = recipient;
+                  this.amount    = amount;
+                  this.incentive = incentive;
+              }
+
+              public long       getId()        { return id; }
+              public UserRecord getSender()    { return sender; }
+              public UserRecord getRecipient() { return recipient; }
+              public float      getAmount()    { return amount; }
+              public float      getIncentive() { return incentive; }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/entity/TransactionRecord.java"
+          echo "TransactionRecord.java written"
+
+      # ── 8. Write DatabaseConduit.java ──────────────────────────────────────
+      - name: "Write component/DatabaseConduit.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/component"
+          cat > "${JAVA_DIR}/component/DatabaseConduit.java" << 'JAVAEOF'
+          package PLACEHOLDER.component;
+
+          import PLACEHOLDER.entity.TransactionRecord;
+          import PLACEHOLDER.entity.UserRecord;
+          import PLACEHOLDER.foundation.Incentive;
+          import PLACEHOLDER.foundation.Transaction;
+          import PLACEHOLDER.repository.TransactionRepository;
+          import PLACEHOLDER.repository.UserRepository;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+          import org.springframework.boot.web.client.RestTemplateBuilder;
+          import org.springframework.stereotype.Component;
+          import org.springframework.transaction.annotation.Transactional;
+          import org.springframework.web.client.RestTemplate;
+
+          @Component
+          public class DatabaseConduit {
+
+              private static final Logger log = LoggerFactory.getLogger(DatabaseConduit.class);
+              private static final String INCENTIVE_URL = "http://localhost:8080/incentive";
+
+              private final UserRepository        userRepository;
+              private final TransactionRepository transactionRepository;
+              private final RestTemplate          restTemplate;
+
+              public DatabaseConduit(UserRepository userRepository,
+                                     TransactionRepository transactionRepository,
+                                     RestTemplateBuilder restTemplateBuilder) {
+                  this.userRepository        = userRepository;
+                  this.transactionRepository = transactionRepository;
+                  this.restTemplate          = restTemplateBuilder.build();
+              }
+
+              @Transactional
+              public void save(UserRecord user) {
+                  userRepository.save(user);
+                  log.info("User saved: id={} name={} balance={}", user.getId(), user.getName(), user.getBalance());
+              }
+
+              @Transactional
+              public void process(Transaction transaction) {
+
+                  UserRecord sender = userRepository.findById(transaction.getSenderId());
+                  if (sender == null) {
+                      log.warn("Discarding — sender {} not found", transaction.getSenderId());
+                      return;
                   }
 
-                  required = [
-                      dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-data-jpa", version="3.2.5"),
-                      dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-web",       version="3.2.5"),
-                      dict(groupId="org.springframework.kafka", artifactId="spring-kafka",                  version="3.1.4"),
-                      dict(groupId="com.h2database",            artifactId="h2",                            version="2.2.224", scope="runtime"),
-                      dict(groupId="org.springframework.boot",  artifactId="spring-boot-starter-test",      version="3.2.5",   scope="test"),
-                      dict(groupId="org.springframework.kafka", artifactId="spring-kafka-test",             version="3.1.4",   scope="test"),
-                      dict(groupId="org.testcontainers",        artifactId="kafka",                         version="1.19.1",  scope="test"),
-                      dict(groupId="com.fasterxml.jackson.core",artifactId="jackson-databind",              version="2.15.4"),
-                  ]
-
-                  for dep in required:
-                      if dep["artifactId"] not in existing:
-                          el = ET.SubElement(deps_el, f"{TAG}dependency")
-                          for k, v in dep.items():
-                              ET.SubElement(el, f"{TAG}{k}").text = v
-                          print(f"  [added] {dep['artifactId']}")
-                      else:
-                          print(f"  [ok]    {dep['artifactId']}")
-
-                  tree.write(POM, xml_declaration=True, encoding="UTF-8")
-                  PYEOF
-
-            # ── 4. Discover package and source directory ───────────────────────────
-            - name: "Discover project layout"
-              id: discover
-              run: |
-                  python3 << 'PYEOF'
-                  import os, subprocess
-                  from pathlib import Path
-
-                  result = subprocess.run(
-                      ["grep", "-rl", "@SpringBootApplication", "src/main/java"],
-                      capture_output=True, text=True
-                  )
-                  main_file = Path(result.stdout.strip().splitlines()[0])
-                  java_dir  = main_file.parent
-
-                  pkg_line = next(
-                      l for l in main_file.read_text().splitlines()
-                      if l.strip().startswith("package ")
-                  )
-                  package = pkg_line.strip().removeprefix("package ").removesuffix(";").strip()
-
-                  print(f"Package  : {package}")
-                  print(f"Java dir : {java_dir}")
-
-                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                      f.write(f"package={package}\n")
-                      f.write(f"java_dir={java_dir}\n")
-                  PYEOF
-
-            # ── 5. Write application.yml ───────────────────────────────────────────
-            - name: "Write application.yml"
-              run: |
-                  APP="src/main/resources/application.yml"
-                  mkdir -p "$(dirname "$APP")"
-                  cat > "$APP" << 'YMLEOF'
-                  general:
-                    kafka-topic: trader-updates
-
-                  server:
-                    port: 33400
-
-                  spring:
-                    kafka:
-                      bootstrap-servers: localhost:9092
-
-                    datasource:
-                      url: jdbc:h2:mem:midasdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
-                      driver-class-name: org.h2.Driver
-                      username: sa
-                      password:
-
-                    jpa:
-                      database-platform: org.hibernate.dialect.H2Dialect
-                      hibernate:
-                        ddl-auto: create-drop
-                      show-sql: false
-                      properties:
-                        hibernate:
-                          format_sql: true
-
-                    h2:
-                      console:
-                        enabled: true
-                        path: /h2-console
-                  YMLEOF
-
-                  python3 -c "
-                  import textwrap, pathlib
-                  p = pathlib.Path('$APP')
-                  p.write_text(textwrap.dedent(p.read_text()))
-                  "
-                  echo "--- application.yml ---"
-                  cat "$APP"
-
-            # ── 6. Write Incentive.java ────────────────────────────────────────────
-            - name: "Write foundation/Incentive.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  mkdir -p "${JAVA_DIR}/foundation"
-                  cat > "${JAVA_DIR}/foundation/Incentive.java" << 'JAVAEOF'
-                  package PLACEHOLDER.foundation;
-
-                  import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
-
-                  @JsonIgnoreProperties(ignoreUnknown = true)
-                  public class Incentive {
-
-                      private float amount;
-
-                      public Incentive() {}
-
-                      public Incentive(float amount) {
-                          this.amount = amount;
-                      }
-
-                      public float getAmount() { return amount; }
-                      public void setAmount(float amount) { this.amount = amount; }
-
-                      @Override
-                      public String toString() {
-                          return "Incentive{amount=" + amount + "}";
-                      }
+                  UserRecord recipient = userRepository.findById(transaction.getRecipientId());
+                  if (recipient == null) {
+                      log.warn("Discarding — recipient {} not found", transaction.getRecipientId());
+                      return;
                   }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/foundation/Incentive.java"
-                  echo "Incentive.java written"
 
-            # ── 7. Write TransactionRecord.java (with incentive field) ────────────
-            - name: "Write entity/TransactionRecord.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  mkdir -p "${JAVA_DIR}/entity"
-                  cat > "${JAVA_DIR}/entity/TransactionRecord.java" << 'JAVAEOF'
-                  package PLACEHOLDER.entity;
-
-                  import jakarta.persistence.*;
-
-                  @Entity
-                  @Table(name = "transaction_record")
-                  public class TransactionRecord {
-
-                      @Id
-                      @GeneratedValue(strategy = GenerationType.IDENTITY)
-                      private long id;
-
-                      @ManyToOne(fetch = FetchType.LAZY, optional = false)
-                      @JoinColumn(name = "sender_id", nullable = false)
-                      private UserRecord sender;
-
-                      @ManyToOne(fetch = FetchType.LAZY, optional = false)
-                      @JoinColumn(name = "recipient_id", nullable = false)
-                      private UserRecord recipient;
-
-                      @Column(nullable = false)
-                      private float amount;
-
-                      @Column(nullable = false)
-                      private float incentive;
-
-                      protected TransactionRecord() {}
-
-                      public TransactionRecord(UserRecord sender, UserRecord recipient,
-                                               float amount, float incentive) {
-                          this.sender    = sender;
-                          this.recipient = recipient;
-                          this.amount    = amount;
-                          this.incentive = incentive;
-                      }
-
-                      public long       getId()        { return id; }
-                      public UserRecord getSender()    { return sender; }
-                      public UserRecord getRecipient() { return recipient; }
-                      public float      getAmount()    { return amount; }
-                      public float      getIncentive() { return incentive; }
+                  if (sender.getBalance() < transaction.getAmount()) {
+                      log.warn("Discarding — sender {} insufficient balance", sender.getName());
+                      return;
                   }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/entity/TransactionRecord.java"
-                  echo "TransactionRecord.java written"
 
-            # ── 8. Write DatabaseConduit.java ──────────────────────────────────────
-            - name: "Write component/DatabaseConduit.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  mkdir -p "${JAVA_DIR}/component"
-                  cat > "${JAVA_DIR}/component/DatabaseConduit.java" << 'JAVAEOF'
-                  package PLACEHOLDER.component;
-
-                  import PLACEHOLDER.entity.TransactionRecord;
-                  import PLACEHOLDER.entity.UserRecord;
-                  import PLACEHOLDER.foundation.Incentive;
-                  import PLACEHOLDER.foundation.Transaction;
-                  import PLACEHOLDER.repository.TransactionRepository;
-                  import PLACEHOLDER.repository.UserRepository;
-                  import org.slf4j.Logger;
-                  import org.slf4j.LoggerFactory;
-                  import org.springframework.boot.web.client.RestTemplateBuilder;
-                  import org.springframework.stereotype.Component;
-                  import org.springframework.transaction.annotation.Transactional;
-                  import org.springframework.web.client.RestTemplate;
-
-                  @Component
-                  public class DatabaseConduit {
-
-                      private static final Logger log = LoggerFactory.getLogger(DatabaseConduit.class);
-                      private static final String INCENTIVE_URL = "http://localhost:8080/incentive";
-
-                      private final UserRepository        userRepository;
-                      private final TransactionRepository transactionRepository;
-                      private final RestTemplate          restTemplate;
-
-                      public DatabaseConduit(UserRepository userRepository,
-                                             TransactionRepository transactionRepository,
-                                             RestTemplateBuilder restTemplateBuilder) {
-                          this.userRepository        = userRepository;
-                          this.transactionRepository = transactionRepository;
-                          this.restTemplate          = restTemplateBuilder.build();
+                  // Call Incentive API
+                  float incentiveAmount = 0f;
+                  try {
+                      Incentive incentive = restTemplate.postForObject(
+                              INCENTIVE_URL, transaction, Incentive.class);
+                      if (incentive != null) {
+                          incentiveAmount = incentive.getAmount();
                       }
-
-                      @Transactional
-                      public void save(UserRecord user) {
-                          userRepository.save(user);
-                          log.info("User saved: id={} name={} balance={}", user.getId(), user.getName(), user.getBalance());
-                      }
-
-                      @Transactional
-                      public void process(Transaction transaction) {
-
-                          UserRecord sender = userRepository.findById(transaction.getSenderId());
-                          if (sender == null) {
-                              log.warn("Discarding — sender {} not found", transaction.getSenderId());
-                              return;
-                          }
-
-                          UserRecord recipient = userRepository.findById(transaction.getRecipientId());
-                          if (recipient == null) {
-                              log.warn("Discarding — recipient {} not found", transaction.getRecipientId());
-                              return;
-                          }
-
-                          if (sender.getBalance() < transaction.getAmount()) {
-                              log.warn("Discarding — sender {} insufficient balance", sender.getName());
-                              return;
-                          }
-
-                          // Call Incentive API
-                          float incentiveAmount = 0f;
-                          try {
-                              Incentive incentive = restTemplate.postForObject(
-                                      INCENTIVE_URL, transaction, Incentive.class);
-                              if (incentive != null) {
-                                  incentiveAmount = incentive.getAmount();
-                              }
-                          } catch (Exception e) {
-                              log.warn("Incentive API unavailable, using incentive=0: {}", e.getMessage());
-                          }
-
-                          // Persist transaction record
-                          transactionRepository.save(
-                                  new TransactionRecord(sender, recipient,
-                                          transaction.getAmount(), incentiveAmount));
-
-                          // Debit sender by amount only (incentive NOT deducted from sender)
-                          // Credit recipient by amount + incentive
-                          sender.setBalance(sender.getBalance() - transaction.getAmount());
-                          recipient.setBalance(recipient.getBalance() + transaction.getAmount() + incentiveAmount);
-                          userRepository.save(sender);
-                          userRepository.save(recipient);
-
-                          log.info("Processed: sender={} newBal={} | recipient={} newBal={} | incentive={}",
-                                  sender.getName(), sender.getBalance(),
-                                  recipient.getName(), recipient.getBalance(),
-                                  incentiveAmount);
-                      }
+                  } catch (Exception e) {
+                      log.warn("Incentive API unavailable, using incentive=0: {}", e.getMessage());
                   }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/DatabaseConduit.java"
-                  echo "DatabaseConduit.java written"
 
-            # ── 9. Write KafkaConsumerConfig.java ─────────────────────────────────
-            - name: "Write component/KafkaConsumerConfig.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  cat > "${JAVA_DIR}/component/KafkaConsumerConfig.java" << 'JAVAEOF'
-                  package PLACEHOLDER.component;
+                  // Persist transaction record
+                  transactionRepository.save(
+                          new TransactionRecord(sender, recipient,
+                                  transaction.getAmount(), incentiveAmount));
 
-                  import PLACEHOLDER.foundation.Transaction;
-                  import org.apache.kafka.clients.consumer.ConsumerConfig;
-                  import org.apache.kafka.common.serialization.StringDeserializer;
-                  import org.springframework.beans.factory.annotation.Value;
-                  import org.springframework.context.annotation.Bean;
-                  import org.springframework.context.annotation.Configuration;
-                  import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
-                  import org.springframework.kafka.core.ConsumerFactory;
-                  import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
-                  import org.springframework.kafka.support.serializer.JsonDeserializer;
+                  // Debit sender by amount only (incentive NOT deducted from sender)
+                  // Credit recipient by amount + incentive
+                  sender.setBalance(sender.getBalance() - transaction.getAmount());
+                  recipient.setBalance(recipient.getBalance() + transaction.getAmount() + incentiveAmount);
+                  userRepository.save(sender);
+                  userRepository.save(recipient);
 
-                  import java.util.HashMap;
-                  import java.util.Map;
+                  log.info("Processed: sender={} newBal={} | recipient={} newBal={} | incentive={}",
+                          sender.getName(), sender.getBalance(),
+                          recipient.getName(), recipient.getBalance(),
+                          incentiveAmount);
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/DatabaseConduit.java"
+          echo "DatabaseConduit.java written"
 
-                  @Configuration
-                  public class KafkaConsumerConfig {
+      # ── 9. Write KafkaConsumerConfig.java ─────────────────────────────────
+      - name: "Write component/KafkaConsumerConfig.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          cat > "${JAVA_DIR}/component/KafkaConsumerConfig.java" << 'JAVAEOF'
+          package PLACEHOLDER.component;
 
-                      @Value("${spring.kafka.bootstrap-servers}")
-                      private String bootstrapServers;
+          import PLACEHOLDER.foundation.Transaction;
+          import org.apache.kafka.clients.consumer.ConsumerConfig;
+          import org.apache.kafka.common.serialization.StringDeserializer;
+          import org.springframework.beans.factory.annotation.Value;
+          import org.springframework.context.annotation.Bean;
+          import org.springframework.context.annotation.Configuration;
+          import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+          import org.springframework.kafka.core.ConsumerFactory;
+          import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+          import org.springframework.kafka.support.serializer.JsonDeserializer;
 
-                      @Bean
-                      public ConsumerFactory<String, Transaction> consumerFactory() {
-                          Map<String, Object> props = new HashMap<>();
-                          props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,  bootstrapServers);
-                          props.put(ConsumerConfig.GROUP_ID_CONFIG,           "midas-consumer-group");
-                          props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,  "earliest");
+          import java.util.HashMap;
+          import java.util.Map;
 
-                          JsonDeserializer<Transaction> deserializer =
-                                  new JsonDeserializer<>(Transaction.class, false);
+          @Configuration
+          public class KafkaConsumerConfig {
 
-                          return new DefaultKafkaConsumerFactory<>(
-                                  props,
-                                  new StringDeserializer(),
-                                  deserializer
-                          );
-                      }
+              @Value("${spring.kafka.bootstrap-servers}")
+              private String bootstrapServers;
 
-                      @Bean
-                      public ConcurrentKafkaListenerContainerFactory<String, Transaction>
-                      kafkaListenerContainerFactory() {
-                          ConcurrentKafkaListenerContainerFactory<String, Transaction> factory =
-                                  new ConcurrentKafkaListenerContainerFactory<>();
-                          factory.setConsumerFactory(consumerFactory());
-                          return factory;
-                      }
+              @Bean
+              public ConsumerFactory<String, Transaction> consumerFactory() {
+                  Map<String, Object> props = new HashMap<>();
+                  props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,  bootstrapServers);
+                  props.put(ConsumerConfig.GROUP_ID_CONFIG,           "midas-consumer-group");
+                  props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,  "earliest");
+
+                  JsonDeserializer<Transaction> deserializer =
+                          new JsonDeserializer<>(Transaction.class, false);
+
+                  return new DefaultKafkaConsumerFactory<>(
+                          props,
+                          new StringDeserializer(),
+                          deserializer
+                  );
+              }
+
+              @Bean
+              public ConcurrentKafkaListenerContainerFactory<String, Transaction>
+              kafkaListenerContainerFactory() {
+                  ConcurrentKafkaListenerContainerFactory<String, Transaction> factory =
+                          new ConcurrentKafkaListenerContainerFactory<>();
+                  factory.setConsumerFactory(consumerFactory());
+                  return factory;
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/KafkaConsumerConfig.java"
+          echo "KafkaConsumerConfig.java written"
+
+      # ── 10. Write TransactionKafkaListener.java ────────────────────────────
+      - name: "Write component/TransactionKafkaListener.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          cat > "${JAVA_DIR}/component/TransactionKafkaListener.java" << 'JAVAEOF'
+          package PLACEHOLDER.component;
+
+          import PLACEHOLDER.foundation.Transaction;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+          import org.springframework.kafka.annotation.KafkaListener;
+          import org.springframework.stereotype.Component;
+
+          @Component
+          public class TransactionKafkaListener {
+
+              private static final Logger log =
+                      LoggerFactory.getLogger(TransactionKafkaListener.class);
+
+              private final DatabaseConduit databaseConduit;
+
+              public TransactionKafkaListener(DatabaseConduit databaseConduit) {
+                  this.databaseConduit = databaseConduit;
+              }
+
+              @KafkaListener(
+                      topics  = "${general.kafka-topic}",
+                      groupId = "midas-consumer-group"
+              )
+              public void listen(Transaction transaction) {
+                  log.info("MIDAS_AMOUNT: {}", transaction.getAmount());
+                  databaseConduit.process(transaction);
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/TransactionKafkaListener.java"
+          echo "TransactionKafkaListener.java written"
+
+      # ── 11. Write BalanceController.java ──────────────────────────────────
+      - name: "Write component/BalanceController.java"
+        env:
+          PACKAGE: ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          cat > "${JAVA_DIR}/component/BalanceController.java" << 'JAVAEOF'
+          package PLACEHOLDER.component;
+
+          import PLACEHOLDER.entity.UserRecord;
+          import PLACEHOLDER.foundation.Balance;
+          import PLACEHOLDER.repository.UserRepository;
+          import org.springframework.web.bind.annotation.GetMapping;
+          import org.springframework.web.bind.annotation.RequestParam;
+          import org.springframework.web.bind.annotation.RestController;
+
+          @RestController
+          public class BalanceController {
+
+              private final UserRepository userRepository;
+
+              public BalanceController(UserRepository userRepository) {
+                  this.userRepository = userRepository;
+              }
+
+              @GetMapping("/balance")
+              public Balance getBalance(@RequestParam Long userId) {
+                  UserRecord user = userRepository.findById((long) userId);
+                  if (user == null) {
+                      return new Balance(0);
                   }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/KafkaConsumerConfig.java"
-                  echo "KafkaConsumerConfig.java written"
+                  return new Balance(user.getBalance());
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/BalanceController.java"
+          echo "BalanceController.java written"
 
-            # ── 10. Write KafkaProducerConfig.java ─────────────────────────────────
-            - name: "Write component/KafkaProducerConfig.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  mkdir -p "${JAVA_DIR}/component"
-                  cat > "${JAVA_DIR}/component/KafkaProducerConfig.java" << 'JAVAEOC'
-                  package PLACEHOLDER.component;
+      # ── 12. Build ──────────────────────────────────────────────────────────
+      - name: "Maven clean install (skip tests)"
+        run: mvn clean install -DskipTests --no-transfer-progress 2>&1 | tee build_output.txt
+        continue-on-error: true
 
-                  import PLACEHOLDER.foundation.Transaction;
-                  import org.apache.kafka.clients.producer.ProducerConfig;
-                  import org.apache.kafka.common.serialization.StringSerializer;
-                  import org.springframework.beans.factory.annotation.Value;
-                  import org.springframework.context.annotation.Bean;
-                  import org.springframework.context.annotation.Configuration;
-                  import org.springframework.kafka.core.DefaultKafkaProducerFactory;
-                  import org.springframework.kafka.core.KafkaTemplate;
-                  import org.springframework.kafka.core.ProducerFactory;
-                  import org.springframework.kafka.support.serializer.JsonSerializer;
+      # ── 13. Find and start Incentive API JAR in background ────────────────
+      - name: "Start Incentive API JAR on port 8080"
+        run: |
+          JAR=$(find . -path "*/services/*.jar" | head -1)
+          if [ -z "$JAR" ]; then
+            echo "WARNING: No JAR found in services/ — incentive will default to 0"
+          else
+            echo "Starting Incentive API from: $JAR"
+            java -jar "$JAR" &
+            echo $! > incentive_api.pid
+            # Wait until port 8080 is accepting connections (up to 30s)
+            for i in $(seq 1 30); do
+              if curl -s http://localhost:8080/incentive -o /dev/null 2>&1; then
+                echo "Incentive API is up (attempt $i)"
+                break
+              fi
+              echo "Waiting for Incentive API... ($i/30)"
+              sleep 1
+            done
+          fi
 
-                  import java.util.HashMap;
-                  import java.util.Map;
+      # ── 14. Run TaskFourTests ──────────────────────────────────────────────
+      - name: "Run TaskFourTests"
+        run: |
+          mvn -Dtest=TaskFourTests test --no-transfer-progress \
+            2>&1 | tee test_output_task4.txt
+        continue-on-error: true
 
-                  @Configuration
-                  public class KafkaProducerConfig {
+      # ── 15. Parse wilbur's balance from Task 4 log ────────────────────────
+      - name: "Parse wilbur balance from Task 4"
+        id: task4
+        run: |
+          python3 << 'PYEOF'
+          import re, math, os
+          from pathlib import Path
 
-                      @Value("${spring.kafka.bootstrap-servers}")
-                      private String bootstrapServers;
+          raw = Path("test_output_task4.txt").read_text(errors="replace") \
+                if Path("test_output_task4.txt").exists() else ""
 
-                      @Bean
-                      public ProducerFactory<String, Transaction> producerFactory() {
-                          Map<String, Object> props = new HashMap<>();
-                          props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-                          props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-                          props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
-                          props.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);  // Disable type headers for simplicity
-                          return new DefaultKafkaProducerFactory<>(props);
-                      }
+          # Look for any log line that mentions "wilbur" and contains a decimal number
+          wilbur_lines = [l for l in raw.splitlines() if "wilbur" in l.lower()]
+          print(f"\n=== Lines mentioning wilbur ===")
+          for l in wilbur_lines:
+              print(f"  {l.strip()}")
 
-                      @Bean
-                      public KafkaTemplate<String, Transaction> kafkaTemplate() {
-                          return new KafkaTemplate<>(producerFactory());
-                      }
-                  }
-                  JAVAEOC
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/KafkaProducerConfig.java"
-                  echo "KafkaProducerConfig.java written"
+          # Take the last balance value next to wilbur
+          final_raw = None
+          for line in reversed(wilbur_lines):
+              nums = re.findall(r"[-\d]+\.[\d]+", line)
+              if nums:
+                  final_raw = nums[-1]
+                  break
 
-            # ── 11. Write TransactionKafkaListener.java ────────────────────────────
-            - name: "Write component/TransactionKafkaListener.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  cat > "${JAVA_DIR}/component/TransactionKafkaListener.java" << 'JAVAEOF'
-                  package PLACEHOLDER.component;
+          if final_raw:
+              val     = float(final_raw)
+              floored = math.floor(val)
+              print(f"\nWilbur final balance: {val} → floor = {floored}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"wilbur_balance={floored}\n")
+          else:
+              print("\nWilbur balance not found in log — check full output above")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("wilbur_balance=NOT_FOUND\n")
+          PYEOF
 
-                  import PLACEHOLDER.foundation.Transaction;
-                  import org.slf4j.Logger;
-                  import org.slf4j.LoggerFactory;
-                  import org.springframework.kafka.annotation.KafkaListener;
-                  import org.springframework.stereotype.Component;
+      # ── 16. Run TaskFiveTests ──────────────────────────────────────────────
+      - name: "Run TaskFiveTests"
+        run: |
+          mvn -Dtest=TaskFiveTests test --no-transfer-progress \
+            2>&1 | tee test_output_task5.txt
+        continue-on-error: true
 
-                  @Component
-                  public class TransactionKafkaListener {
+      # ── 17. Extract Task 5 BEGIN...END output ─────────────────────────────
+      - name: "Extract Task 5 output snippet"
+        run: |
+          python3 << 'PYEOF'
+          import re
+          from pathlib import Path
 
-                      private static final Logger log =
-                              LoggerFactory.getLogger(TransactionKafkaListener.class);
+          raw = Path("test_output_task5.txt").read_text(errors="replace") \
+                if Path("test_output_task5.txt").exists() else ""
 
-                      private final DatabaseConduit databaseConduit;
+          match = re.search(r"(---begin output ---.*?---end output ---)", raw, re.DOTALL)
+          snippet = match.group(1).strip() if match else "NOT FOUND — check full log"
 
-                      public TransactionKafkaListener(DatabaseConduit databaseConduit) {
-                          this.databaseConduit = databaseConduit;
-                      }
+          print("\n=== Task 5 output snippet ===")
+          print(snippet)
 
-                      @KafkaListener(
-                              topics  = "${general.kafka-topic}",
-                              groupId = "midas-consumer-group"
-                      )
-                      public void listen(Transaction transaction) {
-                          log.info("MIDAS_AMOUNT: {}", transaction.getAmount());
-                          databaseConduit.process(transaction);
-                      }
-                  }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/TransactionKafkaListener.java"
-                  echo "TransactionKafkaListener.java written"
+          Path("task5_snippet.txt").write_text(snippet)
+          PYEOF
 
-            # ── 12. Write BalanceController.java ──────────────────────────────────
-            - name: "Write component/BalanceController.java"
-              env:
-                  PACKAGE: ${{ steps.discover.outputs.package }}
-                  JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
-              run: |
-                  cat > "${JAVA_DIR}/component/BalanceController.java" << 'JAVAEOF'
-                  package PLACEHOLDER.component;
+      # ── 18. Write combined answer markdown ────────────────────────────────
+      - name: "Write task4_5_answer.md"
+        env:
+          WILBUR: ${{ steps.task4.outputs.wilbur_balance }}
+        run: |
+          python3 << 'PYEOF'
+          import os, textwrap
+          from pathlib import Path
 
-                  import PLACEHOLDER.entity.UserRecord;
-                  import PLACEHOLDER.foundation.Balance;
-                  import PLACEHOLDER.repository.UserRepository;
-                  import org.springframework.web.bind.annotation.GetMapping;
-                  import org.springframework.web.bind.annotation.RequestParam;
-                  import org.springframework.web.bind.annotation.RestController;
+          wilbur   = os.environ.get("WILBUR", "NOT_FOUND")
+          snippet  = Path("task5_snippet.txt").read_text() \
+                     if Path("task5_snippet.txt").exists() else "NOT FOUND"
+          raw4     = Path("test_output_task4.txt").read_text(errors="replace") \
+                     if Path("test_output_task4.txt").exists() else ""
+          raw5     = Path("test_output_task5.txt").read_text(errors="replace") \
+                     if Path("test_output_task5.txt").exists() else ""
 
-                  @RestController
-                  public class BalanceController {
+          md = f"""# Midas Tasks 4 & 5 — Answers
 
-                      private final UserRepository userRepository;
+          ## Task 4 — Wilbur's balance after all transactions
 
-                      public BalanceController(UserRepository userRepository) {
-                          this.userRepository = userRepository;
-                      }
+          > ✅ **Submit this value: `{wilbur}`**
 
-                      @GetMapping("/balance")
-                      public Balance getBalance(@RequestParam Long userId) {
-                          UserRecord user = userRepository.findById((long) userId);
-                          if (user == null) {
-                              return new Balance(0);
-                          }
-                          return new Balance(user.getBalance());
-                      }
-                  }
-                  JAVAEOF
-                  sed -i "s|PLACEHOLDER|${PACKAGE}|g" "${JAVA_DIR}/component/BalanceController.java"
-                  echo "BalanceController.java written"
+          ---
 
-            # ── 13. Build ──────────────────────────────────────────────────────────
-            - name: "Maven clean install (skip tests)"
-              run: mvn clean install -DskipTests --no-transfer-progress 2>&1 | tee
-                  build_output.txt
-              continue-on-error: true
+          ## Task 5 — TaskFiveTests output
 
-            # ── 14. Find and start Incentive API JAR in background ────────────────
-            - name: "Start Incentive API JAR on port 8080"
-              run: |
-                  JAR=$(find . -path "*/services/*.jar" | head -1)
-                  if [ -z "$JAR" ]; then
-                    echo "WARNING: No JAR found in services/ — incentive will default to 0"
-                  else
-                    echo "Starting Incentive API from: $JAR"
-                    java -jar "$JAR" &
-                    echo $! > incentive_api.pid
-                    # Wait until port 8080 is accepting connections (up to 30s)
-                    for i in $(seq 1 30); do
-                      if curl -s http://localhost:8080/incentive -o /dev/null 2>&1; then
-                        echo "Incentive API is up (attempt $i)"
-                        break
-                      fi
-                      echo "Waiting for Incentive API... ($i/30)"
-                      sleep 1
-                    done
-                  fi
+          ```
+          {snippet}
+          ```
 
-            # ── 15. Run TaskFourTests ──────────────────────────────────────────────
-            - name: "Run TaskFourTests"
-              id: task4
-              run: |
-                  mvn -Dtest=TaskFourTests test --no-transfer-progress \
-                    2>&1 | tee test_output_task4.txt
+          ---
 
-                  wilbur_balance=$(python3 - <<'PYEOF'
-                  import re
-                  from pathlib import Path
+          ## Full Task 4 log
 
-                  raw = Path("test_output_task4.txt").read_text(errors="replace") \
-                        if Path("test_output_task4.txt").exists() else ""
-                  match = re.search(r"wilbur(?:'s)? balance.*?([0-9]+(?:\.[0-9]+)?)", raw, re.IGNORECASE)
-                  print(match.group(1) if match else "NOT_FOUND")
-                  PYEOF
-                  )
-                  echo "wilbur_balance=${wilbur_balance}" >> "$GITHUB_OUTPUT"
-              continue-on-error: true
+          <details><summary>Click to expand</summary>
 
-            # ── 16. Run TaskFiveTests ──────────────────────────────────────────────
-            - name: "Run TaskFiveTests"
-              run: |
-                  mvn -Dtest=TaskFiveTests test --no-transfer-progress \
-                    2>&1 | tee test_output_task5.txt
-              continue-on-error: true
+          ```
+          {raw4}
+          ```
 
-            # ── 17. Extract Task 5 BEGIN...END output ─────────────────────────────
-            - name: "Extract Task 5 output snippet"
-              run: |
-                  python3 << 'PYEOF'
-                  import re
-                  from pathlib import Path
+          </details>
 
-                  raw = Path("test_output_task5.txt").read_text(errors="replace") \
-                        if Path("test_output_task5.txt").exists() else ""
+          ## Full Task 5 log
 
-                  match = re.search(r"(---begin output ---.*?---end output ---)", raw, re.DOTALL)
-                  snippet = match.group(1).strip() if match else "NOT FOUND — check full log"
+          <details><summary>Click to expand</summary>
 
-                  print("\n=== Task 5 output snippet ===")
-                  print(snippet)
+          ```
+          {raw5}
+          ```
 
-                  Path("task5_snippet.txt").write_text(snippet)
-                  PYEOF
+          </details>
+          """
 
-            # ── 18. Write combined answer markdown ────────────────────────────────
-            - name: "Write task4_5_answer.md"
-              env:
-                  WILBUR: ${{ steps.task4.outputs.wilbur_balance }}
-              run: |
-                  python3 << 'PYEOF'
-                  import os, textwrap
-                  from pathlib import Path
+          Path("task4_5_answer.md").write_text(textwrap.dedent(md))
+          print("task4_5_answer.md written")
+          print(f"\nTask 4 — wilbur's balance: {wilbur}")
+          print(f"\nTask 5 snippet:\n{snippet}")
+          PYEOF
 
-                  wilbur   = os.environ.get("WILBUR", "NOT_FOUND")
-                  snippet  = Path("task5_snippet.txt").read_text() \
-                             if Path("task5_snippet.txt").exists() else "NOT FOUND"
-                  raw4     = Path("test_output_task4.txt").read_text(errors="replace") \
-                             if Path("test_output_task4.txt").exists() else ""
-                  raw5     = Path("test_output_task5.txt").read_text(errors="replace") \
-                             if Path("test_output_task5.txt").exists() else ""
+      # ── 19. Commit generated files ─────────────────────────────────────────
+      - name: "Commit generated files"
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pom.xml \
+                  src/main/resources/application.yml \
+                  src/main/java \
+                  task4_5_answer.md 2>/dev/null || true
+          git add -u src/main/java 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "ci: Tasks 4 & 5 — Incentive API + Balance endpoint [skip ci]"
+            git push
+          fi
 
-                  md = f"""# Midas Tasks 4 & 5 — Answers
+      # ── 20. Upload artifacts ───────────────────────────────────────────────
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "task4-5-results"
+          path: |
+            task4_5_answer.md
+            test_output_task4.txt
+            test_output_task5.txt
+            build_output.txt
+          retention-days: 30
 
-                  ## Task 4 — Wilbur's balance after all transactions
-
-                  > ✅ **Submit this value: `{wilbur}`**
-
-                  ---
-
-                  ## Task 5 — TaskFiveTests output
-
-                  ```
-                  {snippet}
-                  ```
-
-                  ---
-
-                  ## Full Task 4 log
-
-                  <details><summary>Click to expand</summary>
-
-                  ```
-                  {raw4}
-                  ```
-
-                  </details>
-
-                  ## Full Task 5 log
-
-                  <details><summary>Click to expand</summary>
-
-                  ```
-                  {raw5}
-                  ```
-
-                  </details>
-                  """
-
-                  Path("task4_5_answer.md").write_text(textwrap.dedent(md))
-                  print("task4_5_answer.md written")
-                  print(f"\nTask 4 — wilbur's balance: {wilbur}")
-                  print(f"\nTask 5 snippet:\n{snippet}")
-                  PYEOF
-
-            # ── 19. Commit generated files ─────────────────────────────────────────
-            - name: "Commit generated files"
-              if: always()
-              run: |
-                  git config user.name  "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git add pom.xml \
-                          src/main/resources/application.yml \
-                          src/main/java \
-                          task4_5_answer.md 2>/dev/null || true
-                  git add -u src/main/java 2>/dev/null || true
-                  if git diff --cached --quiet; then
-                    echo "Nothing to commit."
-                  else
-                    git commit -m "ci: Tasks 4 & 5 — Incentive API + Balance endpoint [skip ci]"
-                    git push
-                  fi
-
-            # ── 20. Upload artifacts ───────────────────────────────────────────────
-            - name: "Upload artifacts"
-              uses: actions/upload-artifact@v4
-              if: always()
-              with:
-                  name: "task4-5-results"
-                  path: |
-                      task4_5_answer.md
-                      test_output_task4.txt
-                      test_output_task5.txt
-                      build_output.txt
-                  retention-days: 30
-
-            # ── 21. Print summary ──────────────────────────────────────────────────
-            - name: "Print summary"
-              if: always()
-              run: cat task4_5_answer.md >> "$GITHUB_STEP_SUMMARY"
+      # ── 21. Print summary ──────────────────────────────────────────────────
+      - name: "Print summary"
+        if: always()
+        run: cat task4_5_answer.md >> "$GITHUB_STEP_SUMMARY"
