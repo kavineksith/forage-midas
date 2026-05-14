@@ -10,17 +10,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
-/**
- * Validates incoming transactions and persists the ones that pass.
- *
- * Validation rules (all three must hold):
- *  1. senderId refers to an existing UserRecord
- *  2. recipientId refers to an existing UserRecord
- *  3. sender.balance >= transaction.amount
- *
- * On success: persist TransactionRecord, debit sender, credit recipient.
- * On failure: discard silently — no DB state modified.
- */
 @Component
 public class DatabaseConduit {
 
@@ -35,32 +24,37 @@ public class DatabaseConduit {
         this.transactionRepository = transactionRepository;
     }
 
+    /** Called by UserPopulator to persist seed user data before tests run. */
+    @Transactional
+    public void save(UserRecord user) {
+        userRepository.save(user);
+        log.info("User saved: id={} name={}", user.getId(), user.getName());
+    }
+
+    /** Validates a transaction and persists it if all three rules pass. */
     @Transactional
     public void process(Transaction transaction) {
 
-        // Rule 1 — sender exists?
         UserRecord sender = userRepository.findById(transaction.getSenderId());
         if (sender == null) {
             log.warn("Discarding — sender {} not found", transaction.getSenderId());
             return;
         }
 
-        // Rule 2 — recipient exists?
         UserRecord recipient = userRepository.findById(transaction.getRecipientId());
         if (recipient == null) {
             log.warn("Discarding — recipient {} not found", transaction.getRecipientId());
             return;
         }
 
-        // Rule 3 — sufficient balance?
         if (sender.getBalance() < transaction.getAmount()) {
             log.warn("Discarding — sender {} balance {} < amount {}",
                     sender.getId(), sender.getBalance(), transaction.getAmount());
             return;
         }
 
-        // All valid: persist and adjust balances
-        transactionRepository.save(new TransactionRecord(sender, recipient, transaction.getAmount()));
+        transactionRepository.save(
+                new TransactionRecord(sender, recipient, transaction.getAmount()));
 
         sender.setBalance(sender.getBalance() - transaction.getAmount());
         recipient.setBalance(recipient.getBalance() + transaction.getAmount());
