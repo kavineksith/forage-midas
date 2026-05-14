@@ -7,16 +7,6 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-/**
- * REST controller that exposes user balance information.
- *
- * Endpoint: GET /balance?userId={id}
- *
- * Returns a JSON-serialized Balance object.
- * If the user does not exist, returns Balance with amount = 0.
- *
- * Runs on port 33400 (configured in application.yml).
- */
 @RestController
 public class BalanceController {
 
