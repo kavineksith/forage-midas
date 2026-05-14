@@ -1,0 +1,229 @@
+# =============================================================================
+# .github/workflows/task2.yml
+#
+# Midas Core — Task 2: Kafka Integration Tests
+#
+# What this workflow does:
+#   1. Checks out your forked forage-midas repository
+#   2. Sets up Java 17
+#   3. Injects all required Maven dependencies into pom.xml
+#   4. Adds the kafka-topic property to application.yml
+#   5. Builds the project with Maven
+#   6. Runs TaskTwoTests (with timeout since it's an infinite loop)
+#   7. Extracts the first four transaction amounts from the logs
+#   8. Writes task2_answer.md with the amounts + full log
+#   9. Commits task2_answer.md back to the branch
+#  10. Uploads artefacts
+# =============================================================================
+
+name: "Midas Task 2 — Kafka Test"
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  task-two:
+    name: "Add deps → Build → Run Kafka Tests → Generate answer MD"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      - name: "Patch pom.xml — add required dependencies"
+        run: |
+          python3 << 'PYEOF'
+          import xml.etree.ElementTree as ET
+
+          POM  = "pom.xml"
+          NS   = "http://maven.apache.org/POM/4.0.0"
+          TAG  = f"{{{NS}}}"
+
+          ET.register_namespace("", NS)
+          tree = ET.parse(POM)
+          root = tree.getroot()
+
+          deps_el = root.find(f"{TAG}dependencies")
+          if deps_el is None:
+              deps_el = ET.SubElement(root, f"{TAG}dependencies")
+
+          existing = {
+              el.findtext(f"{TAG}artifactId", "")
+              for el in deps_el.findall(f"{TAG}dependency")
+          }
+
+          required = [
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-data-jpa",
+                   version="3.2.5"),
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-web",
+                   version="3.2.5"),
+              dict(groupId="org.springframework.kafka",
+                   artifactId="spring-kafka",
+                   version="3.1.4"),
+              dict(groupId="com.fasterxml.jackson.core",
+                   artifactId="jackson-databind",
+                   version="2.15.4"),
+              dict(groupId="com.h2database",
+                   artifactId="h2",
+                   version="2.2.224",
+                   scope="runtime"),
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-test",
+                   version="3.2.5",
+                   scope="test"),
+              dict(groupId="org.springframework.kafka",
+                   artifactId="spring-kafka-test",
+                   version="3.1.4",
+                   scope="test"),
+              dict(groupId="org.testcontainers",
+                   artifactId="kafka",
+                   version="1.19.1",
+                   scope="test"),
+          ]
+
+          added = []
+          for dep in required:
+              if dep["artifactId"] in existing:
+                  continue
+              dep_el = ET.SubElement(deps_el, f"{TAG}dependency")
+              for key, val in dep.items():
+                  ET.SubElement(dep_el, f"{TAG}{key}").text = val
+              added.append(dep["artifactId"])
+
+          tree.write(POM, xml_declaration=True, encoding="UTF-8")
+          PYEOF
+
+      - name: "Patch application.yml — configure Kafka"
+        run: |
+          APP_YML="src/main/resources/application.yml"
+          mkdir -p "$(dirname "$APP_YML")"
+          touch "$APP_YML"
+
+          if grep -q "kafka-topic" "$APP_YML"; then
+            echo "kafka-topic already present"
+          else
+            cat << 'EOF' >> "$APP_YML"
+
+          general:
+            kafka-topic: trader-updates
+
+          spring:
+            kafka:
+              consumer:
+                group-id: midas-core-group
+                auto-offset-reset: earliest
+                key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+                value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+                properties:
+                  spring.json.trusted.packages: "*"
+          EOF
+          fi
+
+      - name: "Maven clean install (skip tests)"
+        run: mvn clean install -DskipTests --no-transfer-progress
+
+      - name: "Run TaskTwoTests (with timeout)"
+        id: run_tests
+        continue-on-error: true
+        # Timeout after 45s since test loops infinitely
+        run: |
+          timeout 45 mvn -Dtest=TaskTwoTests test --no-transfer-progress \
+            2>&1 | tee test_output.txt || true
+
+      - name: "Extract transaction amounts → task2_answer.md"
+        run: |
+          python3 << 'PYEOF'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          raw = Path("test_output.txt").read_text(errors="replace")
+          
+          # Find all logged transactions
+          # TransactionListener logs: Received transaction: Transaction {senderId=..., recipientId=..., amount=...}
+          pattern = r"Received transaction: Transaction \{.*?amount=([0-9\.]+)\}"
+          amounts = re.findall(pattern, raw)
+
+          if not amounts:
+              amounts = ["NOT FOUND - check log"] * 4
+
+          first_four = amounts[:4]
+          amounts_list = "\n".join([f"{i+1}. {amt}" for i, amt in enumerate(first_four)])
+
+          md = f"""\
+          # Midas Task 2 — Answer
+
+          ## ✅ First Four Transaction Amounts
+
+          ```
+          {amounts_list}
+          ```
+
+          ---
+
+          ## 📋 Full Test Output
+
+          <details>
+          <summary>Click to expand</summary>
+
+          ```
+          {raw}
+          ```
+
+          </details>
+          """
+
+          md = textwrap.dedent(md)
+          Path("task2_answer.md").write_text(md)
+          
+          print("=== First Four Amounts ===")
+          print(amounts_list)
+          PYEOF
+
+      - name: "Commit task2_answer.md to branch"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pom.xml \
+                  src/main/resources/application.yml \
+                  src/main/java/com/jpmc/midascore/component/TransactionListener.java \
+                  task2_answer.md
+          if git diff --cached --quiet; then
+            echo "Nothing changed — no commit needed."
+          else
+            git commit -m "ci: Task 2 — add TransactionListener, deps, and answer snippet [skip ci]"
+            git push
+          fi
+
+      - name: "Upload task2_answer.md and test log as artefacts"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "task2-results"
+          path: |
+            task2_answer.md
+            test_output.txt
+          retention-days: 30
+
+      - name: "Print answer to job summary"
+        if: always()
+        run: cat task2_answer.md >> "$GITHUB_STEP_SUMMARY"
