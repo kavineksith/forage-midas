@@ -1,0 +1,536 @@
+# =============================================================================
+# .github/workflows/task3.yml
+#
+# Midas Core — Task 3: H2 / JPA Database Integration & waldorf Balance
+#
+# What this workflow does:
+#   1.  Checkout & Java 17
+#   2.  Ensure all Task 1 pom.xml dependencies are present
+#   3.  Patch application.yml with H2 + JPA configuration
+#   4.  Write TransactionRecord.java           → entity/
+#   5.  Write TransactionRepository.java       → repository/
+#   6.  Write DatabaseConduit.java             → component/  (validation + persistence)
+#   7.  Overwrite TransactionKafkaListener.java → component/ (wire DatabaseConduit)
+#   8.  mvn clean install (skip tests)
+#   9.  Run TaskThreeTests — capture full output
+#  10.  Parse waldorf's final balance from the log
+#  11.  Write task3_answer.md
+#  12.  Commit everything back [skip ci]
+#  13.  Upload artefacts + print Actions summary
+# =============================================================================
+
+name: "Midas Task 3 — H2 Database & waldorf Balance"
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  task-three:
+    name: "JPA integration → Run TaskThreeTests → Report waldorf balance"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Java 17 ─────────────────────────────────────────────────────────
+      - name: "Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven"
+
+      # ── 3. Ensure pom.xml dependencies (idempotent) ────────────────────────
+      - name: "Ensure required dependencies in pom.xml"
+        run: |
+          python3 << 'PYEOF'
+          import xml.etree.ElementTree as ET
+
+          POM = "pom.xml"
+          NS  = "http://maven.apache.org/POM/4.0.0"
+          TAG = f"{{{NS}}}"
+          ET.register_namespace("", NS)
+
+          tree = ET.parse(POM)
+          root = tree.getroot()
+          deps_el = root.find(f"{TAG}dependencies") or ET.SubElement(root, f"{TAG}dependencies")
+          existing = {el.findtext(f"{TAG}artifactId","") for el in deps_el.findall(f"{TAG}dependency")}
+
+          required = [
+              dict(groupId="org.springframework.boot", artifactId="spring-boot-starter-data-jpa", version="3.2.5"),
+              dict(groupId="org.springframework.boot", artifactId="spring-boot-starter-web",       version="3.2.5"),
+              dict(groupId="org.springframework.kafka", artifactId="spring-kafka",                 version="3.1.4"),
+              dict(groupId="com.h2database",            artifactId="h2",                           version="2.2.224", scope="runtime"),
+              dict(groupId="org.springframework.boot", artifactId="spring-boot-starter-test",     version="3.2.5", scope="test"),
+              dict(groupId="org.springframework.kafka", artifactId="spring-kafka-test",            version="3.1.4", scope="test"),
+              dict(groupId="org.testcontainers",        artifactId="kafka",                        version="1.19.1", scope="test"),
+          ]
+          for dep in required:
+              if dep["artifactId"] not in existing:
+                  el = ET.SubElement(deps_el, f"{TAG}dependency")
+                  for k,v in dep.items(): ET.SubElement(el, f"{TAG}{k}").text = v
+                  print(f"  [added] {dep['artifactId']}")
+          tree.write(POM, xml_declaration=True, encoding="UTF-8")
+          PYEOF
+
+      # ── 4. Patch application.yml ───────────────────────────────────────────
+      - name: "Patch application.yml — kafka-topic + H2 + JPA"
+        run: |
+          APP="src/main/resources/application.yml"
+          mkdir -p "$(dirname "$APP")"
+
+          # Write the complete authoritative application.yml for Task 3
+          cat > "$APP" << 'YMLEOF'
+          general:
+            kafka-topic: trader-updates
+
+          spring:
+            datasource:
+              url: jdbc:h2:mem:midasdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+              driver-class-name: org.h2.Driver
+              username: sa
+              password:
+
+            jpa:
+              database-platform: org.hibernate.dialect.H2Dialect
+              hibernate:
+                ddl-auto: create-drop
+              show-sql: false
+              properties:
+                hibernate:
+                  format_sql: true
+
+            h2:
+              console:
+                enabled: true
+                path: /h2-console
+          YMLEOF
+
+          # De-indent (heredoc adds 10 spaces of padding from YAML above)
+          python3 -c "
+          import textwrap, pathlib
+          p = pathlib.Path('$APP')
+          p.write_text(textwrap.dedent(p.read_text()))
+          "
+          echo "--- application.yml ---"
+          cat "$APP"
+
+      # ── 5. Discover package & source directories ───────────────────────────
+      - name: "Discover project layout"
+        id: discover
+        run: |
+          python3 << 'PYEOF'
+          import os, subprocess
+          from pathlib import Path
+
+          result = subprocess.run(
+              ["grep", "-rl", "@SpringBootApplication", "src/main/java"],
+              capture_output=True, text=True
+          )
+          main_file = Path(result.stdout.strip().splitlines()[0])
+          java_dir  = main_file.parent
+
+          pkg_line = next(
+              l for l in main_file.read_text().splitlines()
+              if l.strip().startswith("package ")
+          )
+          package = pkg_line.strip().removeprefix("package ").removesuffix(";").strip()
+
+          print(f"Package  : {package}")
+          print(f"Java dir : {java_dir}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"package={package}\n")
+              f.write(f"java_dir={java_dir}\n")
+          PYEOF
+
+      # ── 6. Write TransactionRecord.java ───────────────────────────────────
+      - name: "Write entity/TransactionRecord.java"
+        env:
+          PACKAGE:  ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/entity"
+          cat > "${JAVA_DIR}/entity/TransactionRecord.java" << 'JAVAEOF'
+          package PLACEHOLDER_PACKAGE.entity;
+
+          import jakarta.persistence.*;
+
+          /**
+           * Persisted record of a validated financial transaction.
+           * Maintains many-to-one relationships with sender and recipient UserRecord entities.
+           */
+          @Entity
+          @Table(name = "transaction_record")
+          public class TransactionRecord {
+
+              @Id
+              @GeneratedValue(strategy = GenerationType.IDENTITY)
+              private long id;
+
+              @ManyToOne(fetch = FetchType.LAZY, optional = false)
+              @JoinColumn(name = "sender_id", nullable = false)
+              private UserRecord sender;
+
+              @ManyToOne(fetch = FetchType.LAZY, optional = false)
+              @JoinColumn(name = "recipient_id", nullable = false)
+              private UserRecord recipient;
+
+              @Column(nullable = false)
+              private float amount;
+
+              protected TransactionRecord() {}
+
+              public TransactionRecord(UserRecord sender, UserRecord recipient, float amount) {
+                  this.sender    = sender;
+                  this.recipient = recipient;
+                  this.amount    = amount;
+              }
+
+              public long getId()              { return id; }
+              public UserRecord getSender()    { return sender; }
+              public UserRecord getRecipient() { return recipient; }
+              public float getAmount()         { return amount; }
+          }
+          JAVAEOF
+
+          # Replace placeholder package with actual package
+          sed -i "s|PLACEHOLDER_PACKAGE|${PACKAGE}|g" "${JAVA_DIR}/entity/TransactionRecord.java"
+          echo "TransactionRecord.java written"
+
+      # ── 7. Write TransactionRepository.java ───────────────────────────────
+      - name: "Write repository/TransactionRepository.java"
+        env:
+          PACKAGE:  ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/repository"
+          cat > "${JAVA_DIR}/repository/TransactionRepository.java" << 'JAVAEOF'
+          package PLACEHOLDER_PACKAGE.repository;
+
+          import PLACEHOLDER_PACKAGE.entity.TransactionRecord;
+          import org.springframework.data.jpa.repository.JpaRepository;
+          import org.springframework.stereotype.Repository;
+
+          @Repository
+          public interface TransactionRepository extends JpaRepository<TransactionRecord, Long> {
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER_PACKAGE|${PACKAGE}|g" "${JAVA_DIR}/repository/TransactionRepository.java"
+          echo "TransactionRepository.java written"
+
+      # ── 8. Write DatabaseConduit.java ──────────────────────────────────────
+      - name: "Write component/DatabaseConduit.java"
+        env:
+          PACKAGE:  ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          mkdir -p "${JAVA_DIR}/component"
+          cat > "${JAVA_DIR}/component/DatabaseConduit.java" << 'JAVAEOF'
+          package PLACEHOLDER_PACKAGE.component;
+
+          import PLACEHOLDER_PACKAGE.entity.TransactionRecord;
+          import PLACEHOLDER_PACKAGE.entity.UserRecord;
+          import PLACEHOLDER_PACKAGE.foundation.Transaction;
+          import PLACEHOLDER_PACKAGE.repository.TransactionRepository;
+          import PLACEHOLDER_PACKAGE.repository.UserRepository;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+          import org.springframework.stereotype.Component;
+          import org.springframework.transaction.annotation.Transactional;
+
+          import java.util.Optional;
+
+          /**
+           * Validates a Transaction against the database and persists valid ones.
+           *
+           * Validation rules:
+           *  1. senderId must map to an existing UserRecord
+           *  2. recipientId must map to an existing UserRecord
+           *  3. sender.balance >= transaction.amount
+           *
+           * On success: save TransactionRecord, debit sender, credit recipient.
+           * On failure: silently discard — no database state is modified.
+           *
+           * @Transactional wraps all three writes in a single unit of work so
+           * partial updates can never leave balances in an inconsistent state.
+           */
+          @Component
+          public class DatabaseConduit {
+
+              private static final Logger log = LoggerFactory.getLogger(DatabaseConduit.class);
+
+              private final UserRepository        userRepository;
+              private final TransactionRepository transactionRepository;
+
+              public DatabaseConduit(UserRepository userRepository,
+                                     TransactionRepository transactionRepository) {
+                  this.userRepository        = userRepository;
+                  this.transactionRepository = transactionRepository;
+              }
+
+              @Transactional
+              public void process(Transaction transaction) {
+
+                  // Rule 1 — sender exists?
+                  Optional<UserRecord> senderOpt = userRepository.findById(transaction.getSenderId());
+                  if (senderOpt.isEmpty()) {
+                      log.warn("Discarding transaction — sender {} not found", transaction.getSenderId());
+                      return;
+                  }
+
+                  // Rule 2 — recipient exists?
+                  Optional<UserRecord> recipientOpt = userRepository.findById(transaction.getRecipientId());
+                  if (recipientOpt.isEmpty()) {
+                      log.warn("Discarding transaction — recipient {} not found", transaction.getRecipientId());
+                      return;
+                  }
+
+                  UserRecord sender    = senderOpt.get();
+                  UserRecord recipient = recipientOpt.get();
+
+                  // Rule 3 — sufficient balance?
+                  if (sender.getBalance() < transaction.getAmount()) {
+                      log.warn("Discarding transaction — sender {} balance {} < amount {}",
+                              sender.getId(), sender.getBalance(), transaction.getAmount());
+                      return;
+                  }
+
+                  // Persist the transaction record
+                  transactionRepository.save(new TransactionRecord(sender, recipient, transaction.getAmount()));
+
+                  // Update balances
+                  sender.setBalance(sender.getBalance() - transaction.getAmount());
+                  recipient.setBalance(recipient.getBalance() + transaction.getAmount());
+                  userRepository.save(sender);
+                  userRepository.save(recipient);
+
+                  log.info("WALDORF_BALANCE_CHECK: user={} balance={}",
+                          recipient.getName(), recipient.getBalance());
+                  log.info("WALDORF_BALANCE_CHECK: user={} balance={}",
+                          sender.getName(), sender.getBalance());
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER_PACKAGE|${PACKAGE}|g" "${JAVA_DIR}/component/DatabaseConduit.java"
+          echo "DatabaseConduit.java written"
+
+      # ── 9. Overwrite TransactionKafkaListener.java ─────────────────────────
+      - name: "Overwrite component/TransactionKafkaListener.java"
+        env:
+          PACKAGE:  ${{ steps.discover.outputs.package }}
+          JAVA_DIR: ${{ steps.discover.outputs.java_dir }}
+        run: |
+          # Support both naming conventions found in forks
+          LISTENER="${JAVA_DIR}/component/TransactionKafkaListener.java"
+          ALT_LISTENER="${JAVA_DIR}/component/TransactionListener.java"
+
+          TARGET="$LISTENER"
+          [ -f "$ALT_LISTENER" ] && TARGET="$ALT_LISTENER"
+
+          cat > "$TARGET" << 'JAVAEOF'
+          package PLACEHOLDER_PACKAGE.component;
+
+          import PLACEHOLDER_PACKAGE.foundation.Transaction;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+          import org.springframework.kafka.annotation.KafkaListener;
+          import org.springframework.stereotype.Component;
+
+          /**
+           * Thin Kafka consumer — delegates immediately to DatabaseConduit.
+           * No business logic lives here; it just bridges the messaging layer to the
+           * persistence layer.
+           */
+          @Component
+          public class TransactionKafkaListener {
+
+              private static final Logger log = LoggerFactory.getLogger(TransactionKafkaListener.class);
+
+              private final DatabaseConduit databaseConduit;
+
+              public TransactionKafkaListener(DatabaseConduit databaseConduit) {
+                  this.databaseConduit = databaseConduit;
+              }
+
+              @KafkaListener(
+                      topics  = "${general.kafka-topic}",
+                      groupId = "midas-consumer-group"
+              )
+              public void listen(Transaction transaction) {
+                  log.info("MIDAS_AMOUNT: {}", transaction.getAmount());
+                  databaseConduit.process(transaction);
+              }
+          }
+          JAVAEOF
+          sed -i "s|PLACEHOLDER_PACKAGE|${PACKAGE}|g" "$TARGET"
+          echo "TransactionKafkaListener written to $TARGET"
+
+      # ── 10. Build ──────────────────────────────────────────────────────────
+      - name: "Maven clean install (skip tests)"
+        run: mvn clean install -DskipTests --no-transfer-progress
+
+      # ── 11. Run TaskThreeTests ─────────────────────────────────────────────
+      - name: "Run TaskThreeTests"
+        run: |
+          mvn -Dtest=TaskThreeTests test --no-transfer-progress \
+            2>&1 | tee test_output_task3.txt
+        continue-on-error: true
+
+      # ── 12. Parse waldorf balance and write answer MD ──────────────────────
+      - name: "Parse waldorf balance → task3_answer.md"
+        run: |
+          python3 << 'PYEOF'
+          import re, math
+          from pathlib import Path
+
+          raw = Path("test_output_task3.txt").read_text(errors="replace")
+
+          # ── Strategy 1: explicit WALDORF_BALANCE_CHECK log lines ─────────
+          waldorf_lines = [
+              m.group(1)
+              for m in re.finditer(
+                  r"WALDORF_BALANCE_CHECK:\s*user=waldorf\s+balance=([\d.]+)", raw
+              )
+          ]
+          final_waldorf_raw = waldorf_lines[-1] if waldorf_lines else None
+
+          # ── Strategy 2: scan generic user balance lines for "waldorf" ────
+          if not final_waldorf_raw:
+              matches = re.findall(
+                  r"user[=:\s]+waldorf[,\s]+balance[=:\s]+([\d.]+)", raw,
+                  re.IGNORECASE
+              )
+              if matches:
+                  final_waldorf_raw = matches[-1]
+
+          # ── Strategy 3: look in BEGIN…END snippet ─────────────────────────
+          snippet_match = re.search(r"(BEGIN.*?END)", raw, re.DOTALL)
+          snippet = snippet_match.group(1).strip() if snippet_match else None
+
+          if snippet:
+              waldorf_in_snippet = re.findall(r"waldorf[^\d]*([\d.]+)", snippet, re.IGNORECASE)
+              if waldorf_in_snippet and not final_waldorf_raw:
+                  final_waldorf_raw = waldorf_in_snippet[-1]
+
+          # ── Format answer ─────────────────────────────────────────────────
+          if final_waldorf_raw:
+              balance_float = float(final_waldorf_raw)
+              balance_int   = math.floor(balance_float)
+              answer_block = f"""
+          ### waldorf's final balance
+
+          | Metric | Value |
+          |--------|-------|
+          | Raw balance (float) | `{balance_float}` |
+          | Rounded down (floor) | **`{balance_int}`** |
+
+          > ✅ **Submit this value:** `{balance_int}`
+          """
+          else:
+              answer_block = """
+          ⚠️  Could not automatically extract waldorf's balance from the test output.
+
+          **How to find it manually:**
+          1. Open `test_output_task3.txt` (downloadable from Actions → Artefacts).
+          2. Search for `waldorf` — look for a balance line near the end of the test.
+          3. Round the value **down** (floor) to the nearest integer and submit it.
+          """
+
+          snippet_section = ""
+          if snippet:
+              snippet_section = f"""
+          ## BEGIN…END snippet
+
+          ```
+          {snippet}
+          ```
+          """
+
+          md = f"""# Midas Task 3 — Answer
+
+          ## Task summary
+          Integrated H2 in-memory database with Spring Data JPA.
+          Implemented validation (sender exists, recipient exists, sufficient balance)
+          and persistence (`TransactionRecord` with `@ManyToOne` to `UserRecord`).
+
+          {answer_block}
+
+          {snippet_section}
+          ---
+
+          ## Files created / modified
+
+          | File | Location | Purpose |
+          |------|----------|---------|
+          | `TransactionRecord.java` | `entity/` | JPA entity — persisted transaction |
+          | `TransactionRepository.java` | `repository/` | Spring Data JPA repo |
+          | `DatabaseConduit.java` | `component/` | Validation + persistence logic |
+          | `TransactionKafkaListener.java` | `component/` | Kafka consumer → delegates to DatabaseConduit |
+          | `application.yml` | `src/main/resources/` | H2 datasource + JPA config |
+
+          ---
+
+          ## Full test output
+
+          <details>
+          <summary>Click to expand</summary>
+
+          ```
+          {raw}
+          ```
+
+          </details>
+          """
+
+          import textwrap
+          Path("task3_answer.md").write_text(textwrap.dedent(md))
+          print("task3_answer.md written")
+          if final_waldorf_raw:
+              print(f"waldorf balance (raw)  : {final_waldorf_raw}")
+              print(f"waldorf balance (floor): {math.floor(float(final_waldorf_raw))}")
+          PYEOF
+
+      # ── 13. Commit all files ───────────────────────────────────────────────
+      - name: "Commit generated files"
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pom.xml \
+                  src/main/resources/application.yml \
+                  src/main/java \
+                  task3_answer.md 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "ci: Task 3 — H2/JPA integration + waldorf balance [skip ci]"
+            git push
+          fi
+
+      # ── 14. Upload artefacts ───────────────────────────────────────────────
+      - name: "Upload artefacts"
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "task3-results"
+          path: |
+            task3_answer.md
+            test_output_task3.txt
+          retention-days: 30
+
+      # ── 15. Actions job summary ────────────────────────────────────────────
+      - name: "Print summary"
+        if: always()
+        run: cat task3_answer.md >> "$GITHUB_STEP_SUMMARY"
