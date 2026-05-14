@@ -1,0 +1,266 @@
+# =============================================================================
+# .github/workflows/task1.yml
+#
+# Midas Core — Task 1: Dependency Setup & Automated Test Runner
+#
+# What this workflow does:
+#   1. Checks out your forked forage-midas repository
+#   2. Sets up Java 17 (Temurin)
+#   3. Injects all required Maven dependencies into pom.xml (idempotent)
+#   4. Adds the kafka-topic property to application.yml
+#   5. Builds the project with Maven
+#   6. Runs TaskOneTests and captures the full output
+#   7. Extracts the BEGIN…END answer snippet from the test output
+#   8. Writes task1_answer.md with the snippet + full log
+#   9. Commits task1_answer.md back to the branch automatically
+#  10. Uploads all artefacts so you can download them from the Actions tab
+#
+# Triggers:
+#   • Every push to main / master
+#   • Every pull request targeting main / master
+#   • Manual trigger via GitHub UI (Actions → Run workflow)
+# =============================================================================
+
+name: "Midas Task 1 — Setup & Test"
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    # lets you trigger this manually from the UI
+
+jobs:
+  task-one:
+    name: "Add deps → Build → Test → Generate answer MD"
+    runs-on: ubuntu-latest
+
+    # Give the job write permission so it can commit task1_answer.md back
+    permissions:
+      contents: write
+
+    steps:
+
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the commit step works cleanly
+
+      # -----------------------------------------------------------------------
+      # 2. Java 17 (Eclipse Temurin — free, widely used in CI)
+      # -----------------------------------------------------------------------
+      - name: "Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "maven" # caches ~/.m2 between runs for faster builds
+
+      # -----------------------------------------------------------------------
+      # 3. Inject required dependencies into pom.xml
+      #    Uses Python's built-in xml.etree so no extra tools are needed.
+      #    The script is idempotent — re-running never duplicates entries.
+      # -----------------------------------------------------------------------
+      - name: "Patch pom.xml — add required dependencies"
+        run: |
+          python3 << 'PYEOF'
+          import xml.etree.ElementTree as ET
+
+          POM  = "pom.xml"
+          NS   = "http://maven.apache.org/POM/4.0.0"
+          TAG  = f"{{{NS}}}"
+
+          # Preserve the namespace so Maven can still read the file
+          ET.register_namespace("", NS)
+
+          tree = ET.parse(POM)
+          root = tree.getroot()
+
+          # Locate (or create) the <dependencies> block
+          deps_el = root.find(f"{TAG}dependencies")
+          if deps_el is None:
+              deps_el = ET.SubElement(root, f"{TAG}dependencies")
+
+          # Collect artifactIds already present to stay idempotent
+          existing = {
+              el.findtext(f"{TAG}artifactId", "")
+              for el in deps_el.findall(f"{TAG}dependency")
+          }
+
+          required = [
+              # ── runtime dependencies ────────────────────────────────────
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-data-jpa",
+                   version="3.2.5"),
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-web",
+                   version="3.2.5"),
+              dict(groupId="org.springframework.kafka",
+                   artifactId="spring-kafka",
+                   version="3.1.4"),
+              dict(groupId="com.h2database",
+                   artifactId="h2",
+                   version="2.2.224",
+                   scope="runtime"),
+              # ── test-scoped dependencies ────────────────────────────────
+              dict(groupId="org.springframework.boot",
+                   artifactId="spring-boot-starter-test",
+                   version="3.2.5",
+                   scope="test"),
+              dict(groupId="org.springframework.kafka",
+                   artifactId="spring-kafka-test",
+                   version="3.1.4",
+                   scope="test"),
+              dict(groupId="org.testcontainers",
+                   artifactId="kafka",
+                   version="1.19.1",
+                   scope="test"),
+          ]
+
+          added = []
+          for dep in required:
+              if dep["artifactId"] in existing:
+                  print(f"  [skip]  {dep['artifactId']} already present")
+                  continue
+              dep_el = ET.SubElement(deps_el, f"{TAG}dependency")
+              for key, val in dep.items():
+                  ET.SubElement(dep_el, f"{TAG}{key}").text = val
+              added.append(dep["artifactId"])
+              print(f"  [added] {dep['artifactId']} {dep['version']}")
+
+          tree.write(POM, xml_declaration=True, encoding="UTF-8")
+          print(f"\npom.xml updated — {len(added)} new dependency/ies added.")
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # 4. Patch application.yml — add general.kafka-topic
+      #    Also idempotent: only appends if the key is not already there.
+      # -----------------------------------------------------------------------
+      - name: "Patch application.yml — add kafka-topic"
+        run: |
+          APP_YML="src/main/resources/application.yml"
+          mkdir -p "$(dirname "$APP_YML")"
+          touch "$APP_YML"
+
+          if grep -q "kafka-topic" "$APP_YML"; then
+            echo "kafka-topic already present — no change needed."
+          else
+            printf '\ngeneral:\n  kafka-topic: trader-updates\n' >> "$APP_YML"
+            echo "kafka-topic appended to application.yml."
+          fi
+
+          echo "--- application.yml ---"
+          cat "$APP_YML"
+
+      # -----------------------------------------------------------------------
+      # 5. Build (skip tests here; tests run separately so we capture output)
+      # -----------------------------------------------------------------------
+      - name: "Maven clean install (skip tests)"
+        run: mvn clean install -DskipTests --no-transfer-progress
+
+      # -----------------------------------------------------------------------
+      # 6. Run TaskOneTests — capture full output to test_output.txt
+      #    continue-on-error: true ensures the next steps always run even if
+      #    some assertions fail, so we can still generate the answer file.
+      # -----------------------------------------------------------------------
+      - name: "Run TaskOneTests"
+        id: run_tests
+        run: |
+          mvn -Dtest=TaskOneTests test --no-transfer-progress \
+            2>&1 | tee test_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # 7 & 8. Extract BEGIN…END snippet and write task1_answer.md
+      # -----------------------------------------------------------------------
+      - name: "Extract answer snippet → task1_answer.md"
+        run: |
+          python3 << 'PYEOF'
+          from pathlib import Path
+          import re
+
+          raw = Path("test_output.txt").read_text(errors="replace")
+
+          # Greedy search: take everything from the first BEGIN to the last END
+          match = re.search(r"(BEGIN.*?END)", raw, re.DOTALL)
+          snippet = match.group(1).strip() if match else (
+              "⚠️  No BEGIN…END block found in test output.\n"
+              "Check the full log below to diagnose the failure."
+          )
+
+          md = f"""\
+          # Midas Task 1 — Answer
+
+          ## ✅ Answer Snippet (copy this into the Forage submission box)
+
+          ```
+          {snippet}
+          ```
+
+          ---
+
+          ## 📋 Full Test Output
+
+          <details>
+          <summary>Click to expand</summary>
+
+          ```
+          {raw}
+          ```
+
+          </details>
+          """
+
+          # De-indent the heredoc-style indentation applied by Python
+          import textwrap
+          md = textwrap.dedent(md)
+
+          Path("task1_answer.md").write_text(md)
+          print("task1_answer.md written successfully.\n")
+          print("=== Extracted snippet ===")
+          print(snippet)
+          PYEOF
+
+      # -----------------------------------------------------------------------
+      # 9. Commit task1_answer.md back to the branch
+      #    This means you can simply pull the branch to get your answer file.
+      # -----------------------------------------------------------------------
+      - name: "Commit task1_answer.md to branch"
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pom.xml \
+                  src/main/resources/application.yml \
+                  task1_answer.md
+          if git diff --cached --quiet; then
+            echo "Nothing changed — no commit needed."
+          else
+            git commit -m "ci: Task 1 — add deps, yml config, and answer snippet [skip ci]"
+            git push
+          fi
+
+      # -----------------------------------------------------------------------
+      # 10. Upload artefacts — downloadable from the Actions tab
+      # -----------------------------------------------------------------------
+      - name: "Upload task1_answer.md and test log as artefacts"
+        uses: actions/upload-artifact@v4
+        if: always() # upload even when tests fail
+        with:
+          name: "task1-results"
+          path: |
+            task1_answer.md
+            test_output.txt
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 11. Print the answer snippet to the GitHub Actions job summary
+      #     so you can read it directly in the Actions UI without downloading
+      # -----------------------------------------------------------------------
+      - name: "Print answer to job summary"
+        if: always()
+        run: cat task1_answer.md >> "$GITHUB_STEP_SUMMARY"
